@@ -1,0 +1,30 @@
+{
+  "_purpose": "Purpose: all worker-extension-authored messages and audit explanations. Audience: operators, context reviewers, and the worker if Pi surfaces an error. Injection: use individual values only; never inject this header or the entire file.",
+  "flags": {
+    "context": "Absolute path to the parent-generated .gho/input/context.json for this worker run."
+  },
+  "errors": {
+    "invalid_resources": "Worker resources are invalid. Review agent-context/tool-definitions.json and agent-context/strings.json before retrying.",
+    "invalid_context": "Worker context is invalid. Expected schema 1, run_id, issue URL/title/body, base_commit, branch, explicit context_files, and a nonempty expected_bootstrap.",
+    "invalid_context_path": "The --gho-context flag must name the current worktree's .gho/input/context.json using an absolute path. Symlinks are not allowed for the context directories or file.",
+    "invalid_worktree": "The worker's tool directory and session directory do not match the recorded worktree.",
+    "missing_bootstrap": "The effective system prompt is missing the expected Isara bootstrap. No model request is permitted.",
+    "missing_context_file": "The effective system prompt does not contain every explicit context file's path and unmodified content. No model request is permitted.",
+    "ambient_context": "Unexpected discovered context files, skills, or a forced system-prompt replacement are present. No model request is permitted.",
+    "unexpected_tools": "The selected tools or their schemas differ from the seven reviewed worker tool definitions. No model request is permitted.",
+    "context_io": "The worker could not read its context or save effective-context.json. No model request is permitted. Check file permissions and retry through the orchestrator.",
+    "audit_failed": "Worker context verification failed. No model request is permitted."
+  },
+  "audit": {
+    "purpose": "Purpose: pre-request worker context evidence. Audience: operators and reviewers. Injection: this file is an audit artifact, not an additional prompt. It is writable by the worker process and is not a cryptographic attestation.",
+    "assumptions": [
+      "The parent launches a fresh JSON-mode Pi process in this worktree, with explicit system, append, task, provider, worker, and session paths. Inputs live under .gho/input; effective-context.json is written outside that read-only input directory.",
+      "Discovery is disabled for extensions, skills, prompt templates, themes, and context files; project trust is declined and built-in tools are disabled.",
+      "The worker is the last prompt-observing extension; the only other explicit extension is the reviewed Isara provider. Later extension mutations are outside this snapshot contract. The parent supplies an isolated Pi home through its sandbox shim.",
+      "Explicit repository safety guidance is preserved in the system prompt. Isara's mandatory bootstrap remains present and can instruct the worker to read repository files.",
+      "Repository files, issue text, command output, and tool results can introduce further context. Resource isolation is not a filesystem sandbox or protection against prompt injection.",
+      "Tool execution, runtime results/errors, Pi protocol framing, and provider request conversion come from pinned Pi and the Isara provider, not agent-context.",
+      "The snapshot records the before_agent_start boundary, not every later provider request, compaction, or runtime tool result."
+    ]
+  }
+}

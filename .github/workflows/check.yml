@@ -1,0 +1,38 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+      - run: uv sync --locked --dev
+      - run: uv run pytest -q
+      - run: uv run ruff check .
+      - run: uv build --wheel
+  typescript:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        directory: [pi, obsidian-plugin]
+    defaults:
+      run:
+        working-directory: ${{ matrix.directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.0'
+          cache: npm
+          cache-dependency-path: ${{ matrix.directory }}/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - if: matrix.directory == 'obsidian-plugin'
+        run: npm run build
+# Live GitHub, Isara credentials, a paid model and a real Obsidian vault are never used here.
+# Qualify macOS Worktrunk/Seatbelt separately with the opt-in local tests in docs/operations.md.

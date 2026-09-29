@@ -1,0 +1,17 @@
+{
+  "_purpose": "Purpose: machine-readable worker handoff contract. Audience: worker, parent renderer, and result validator. Injection: remove this top-level _purpose field before serializing the schema into worker-task.md. ready_for_review requests human review; it does not complete or approve the issue.",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "summary", "tests", "blockers"],
+  "properties": {
+    "status": {"type": "string", "enum": ["ready_for_review", "blocked"]},
+    "summary": {"type": "string", "minLength": 1, "description": "Brief changes made or reason work could not proceed; not a completion claim."},
+    "tests": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Actual commands or checks and their observed outcomes. State important checks not run and why."},
+    "blockers": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Decisions, safety conflicts, or missing capabilities that prevent a reviewable handoff."}
+  },
+  "allOf": [
+    {"if": {"properties": {"status": {"const": "blocked"}}}, "then": {"properties": {"blockers": {"minItems": 1}}}},
+    {"if": {"properties": {"status": {"const": "ready_for_review"}}}, "then": {"properties": {"blockers": {"maxItems": 0}}}}
+  ]
+}
