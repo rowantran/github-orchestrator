@@ -2,7 +2,7 @@
 
 This desktop-only plugin displays explicit GitHub issue links in task notes and applies explicit completion requests through TaskNotes. It has no network client, credentials, worker prompts, or scheduled polling. GitHub Orchestrator works without this plugin.
 
-**The caller must verify every associated GitHub issue is completed before calling `Notes.request_completion`.** The plugin checks the request against the current association, not GitHub. A closed issue marked “not planned” is not successful completion.
+**The caller must verify every associated GitHub issue is completed before calling `Notes::request_completion`.** The plugin checks the request against the current association, not GitHub. A closed issue marked “not planned” is not successful completion.
 
 ## Build and test
 
@@ -17,26 +17,27 @@ Tests use pure helpers, fake completion ports, and temporary directories. They d
 
 TaskNotes must expose its runtime `tasks.write` and `tasks.events` capabilities. Its HTTP API and MCP can stay disabled. Run **GitHub Orchestrator Bridge: Refresh issue links and completion requests** to reconcile manually. Otherwise the plugin reconciles on layout readiness, relevant vault/metadata events, and a debounced filesystem watcher on the hidden bridge directory. If the watcher is unavailable, the notice directs you to the manual command.
 
-## Python interface
+## Rust interface
 
-```python
-from pathlib import Path
-from github_orchestrator.notes import Notes
+`gho notes link`, `gho notes list` and `gho notes complete` use this API from `src/notes.rs`:
 
-notes = Notes(Path("/path/to/your/vault"))
-link = notes.link("Tasks/example.md", ["https://github.com/example/repo/issues/1"])
-links = notes.links()
-# Only after the caller verifies ALL current link["issueUrls"] are completed:
-request = notes.request_completion(link)
+```rust
+use github_orchestrator::notes::Notes;
+
+let notes = Notes::new(Path::new("/path/to/your/vault"))?;
+let link = notes.link("Tasks/example.md", &["https://github.com/example/repo/issues/1"])?;
+let links = notes.links()?;
+// Only after the caller verifies ALL current link.issue_urls are completed:
+let request = notes.request_completion(&link)?;
 ```
 
 - `link` replaces the complete issue set; it does not append implicitly. `add(note_path, issue_urls)` atomically unions issues with the existing association and preserves its stable ID. Use `add` for task creation with a note, and `link` for explicit whole-set replacement. Repeated additions are idempotent. URLs are canonical lowercase, unique, and sorted. The set must be nonempty.
-- `link` preserves the existing association ID and infers `notionPageId` from safe `notion_page_id` YAML. Only `type: task` notes are accepted. YAML aliases are rejected.
-- `links` returns current associations. `request_completion` rejects a stale association dictionary. A successful call means **queued**, not completed.
+- `link` preserves the existing association ID and infers `notionPageId` from safe `notion_page_id` YAML. Only `type: task` notes are accepted. YAML aliases and tags are rejected.
+- `links` returns current associations. `request_completion` rejects a stale association. A successful call means **queued**, not completed.
 - `completion_state(link)` returns `None`, or the latest exact-set request's `{status, requestId, requestedAt, issueFingerprint, receipt}`. Without a receipt, status is `pending`, or `stale` after 24 hours. Otherwise status comes from the validated receipt. Callers can suppress duplicate pending/accepted requests and require an explicit retry after terminal failure. Existing accepted receipts do not expire. This lookup and explicit request creation are separate locked operations; callers must serialize competing sync runs if they need atomic duplicate suppression.
 - Each explicit `request_completion` call creates a new request ID. Only make another call after inspecting the previous receipt and deliberately choosing to retry. Requests are not generated automatically from note status.
 - Paths are vault-relative Markdown paths; traversal, hidden note folders, backslashes and symlinks are rejected. Bridge symlinks are also rejected. The bridge assumes trusted local processes; it is not a security boundary against concurrent malicious filesystem replacement.
-- Python never writes task Markdown, frontmatter, or completion status.
+- `gho` never writes task Markdown, frontmatter, or completion status.
 
 ## File contract (schema version 1)
 
@@ -64,7 +65,7 @@ lock/                         # only while a cooperating reader/writer holds it
 
 A Notion association also has `notionPageId`, normalized to a lowercase dashed UUID. That ID is authoritative; the plugin resolves it through Obsidian metadata and updates `notePath`. Duplicate identities fail closed. Native notes use the path and a stable association UUID; Obsidian rename events update the registry. Native renames made while the plugin is disabled cannot be inferred safely; restore the old path or deliberately repair the association. Do not guess from a title.
 
-A completion request contains `schemaVersion`, UUID `id`, `linkId`, the exact sorted `issueUrls`, `issueFingerprint`, and UTC ISO `requestedAt`. The fingerprint is SHA-256 of the UTF-8 compact JSON URL array (`JSON.stringify` in TypeScript; `json.dumps(..., separators=(",", ":"))` in Python). Immediately before completion, the plugin requires both the current link ID and exact issue set to match. An unprocessed request older than 24 hours receives a terminal `stale` receipt without calling TaskNotes; recheck GitHub before explicitly requesting again. This limits offline delay but does not revalidate GitHub within the 24-hour window. A rename alone does not invalidate the issue set.
+A completion request contains `schemaVersion`, UUID `id`, `linkId`, the exact sorted `issueUrls`, `issueFingerprint`, and UTC ISO `requestedAt`. The fingerprint is SHA-256 of the UTF-8 compact JSON URL array (`JSON.stringify` in TypeScript; `serde_json::to_string` in Rust). Immediately before completion, the plugin requires both the current link ID and exact issue set to match. An unprocessed request older than 24 hours receives a terminal `stale` receipt without calling TaskNotes; recheck GitHub before explicitly requesting again. This limits offline delay but does not revalidate GitHub within the 24-hour window. A rename alone does not invalidate the issue set.
 
 The shared lock is an exclusively created directory. Both implementations retry briefly, then fail with an actionable error. JSON writes use a same-directory temporary file, file sync, and atomic rename. Never delete an active lock. If a process crashes, stop all bridge users before removing a stale `lock/`. Do not run multiple devices against a cloud-synced bridge directory concurrently; cloud sync is not a distributed lock. Back up `links.json`; request/receipt files are local operational history. No Git configuration is changed automatically.
 

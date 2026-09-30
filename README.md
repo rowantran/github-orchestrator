@@ -12,11 +12,11 @@ GitHub is the only task store. `gho` keeps no local state: a task is "in progres
 
 ## Install and configure
 
-You need Python 3.12+ and `uv`, Git, an authenticated GitHub CLI (`gh`) with Projects scope, Worktrunk (`wt`), and Pi.
+You need Rust (`cargo`), Git, an authenticated GitHub CLI (`gh`) with Projects scope, Worktrunk (`wt`), and Pi.
 
 ```sh
 # The gho CLI
-uv tool install git+https://github.com/rowantran/github-orchestrator
+cargo install --locked --git https://github.com/rowantran/github-orchestrator
 # The orchestrator skill, as a Pi package
 pi install git:github.com/rowantran/github-orchestrator
 
@@ -29,7 +29,7 @@ gho doctor
 
 The config is written to `~/.config/github-orchestrator/config.toml`. Override it with `GHO_CONFIG` or `gho --config PATH`. Worktrees go wherever your Worktrunk configuration puts them.
 
-To update later: `uv tool upgrade github-orchestrator` and `pi update`.
+To update later: rerun the `cargo install` command and `pi update`.
 
 ## Use it through the orchestrator
 
@@ -49,9 +49,9 @@ gho worktree 43 --base rowantran/gh-42   # stack on unmerged work
 Links Obsidian task notes to GitHub issues and marks the note done when all its issues are completed.
 
 ```sh
-# From a clone of this repository (the plugin is not in the uv tool install):
+# From a clone of this repository (the plugin is not part of the cargo install):
 (cd obsidian-plugin && npm ci && npm test && npm run build)
-uv run gho notes install    # then enable the plugin in Obsidian yourself
+cargo run -- notes install    # then enable the plugin in Obsidian yourself
 gho notes link "Tasks/example.md" 42 43
 gho notes complete          # request completion for notes whose issues are all completed
 ```
@@ -60,11 +60,12 @@ gho notes complete          # request completion for notes whose issues are all 
 
 ## Development
 
-Work from a clone: `uv sync --dev`, then `uv run gho …`. To load your local skill edits in Pi instead of the GitHub version, `pi install /absolute/path/to/clone` (and `pi remove` the git source).
+Work from a clone: `cargo run -- …`. To load your local skill edits in Pi instead of the GitHub version, `pi install /absolute/path/to/clone` (and `pi remove` the git source).
 
 ```sh
-uv run pytest
-uv run ruff check .
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 (cd obsidian-plugin && npm ci && npm test && npm run build)
 ```
 

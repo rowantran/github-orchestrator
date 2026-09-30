@@ -1,0 +1,406 @@
+//! The gho command: register work, find ready work, create worktrees. Agents are launched by the orchestrator.
+
+use std::ffi::OsString;
+use std::fs;
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+
+use clap::{Parser, Subcommand};
+use serde::Serialize;
+
+use crate::config::{Config, default_config_path};
+use crate::domain::{IssueRef, IssueState};
+use crate::github::GitHub;
+use crate::notes::{Notes, Status, note_path};
+use crate::paths::{expand_user, resolve};
+use crate::process::{Cmd, Runner, System, which};
+use crate::work::{Entry, Issues, State, survey};
+use crate::workspace::{Workspace, github_remote_repo};
+use crate::{Error, Result, bail, ensure};
+
+#[derive(Debug, Parser)]
+#[command(name = "gho", version, about = "Your GitHub issue queue → ready work → Worktrunk worktrees.")]
+pub struct Cli {
+    /// Queue configuration TOML [default: $GHO_CONFIG, or ~/.config/github-orchestrator/config.toml]
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Write a queue config; never creates a Project
+    Init(InitArgs),
+    /// Check git, gh, wt and GitHub Project access
+    Doctor,
+    /// List queue issues whose blockers are all done
+    Ready {
+        /// Also list blocked and in-progress issues
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create the issue's branch and worktree; prints JSON
+    Worktree {
+        /// Issue number or URL
+        issue: String,
+        /// Branch or commit to stack on (default: latest origin/<base branch>)
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Register work as GitHub issues
+    #[command(subcommand)]
+    Task(TaskCommand),
+    /// Optional TaskNotes bridge
+    #[command(subcommand)]
+    Notes(NotesCommand),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct InitArgs {
+    /// Repository checkout that gets the worktrees [default: current directory]
+    #[arg(long)]
+    pub checkout: Option<PathBuf>,
+    /// OWNER/REPO [default: the checkout's origin]
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// GitHub login [default: the authenticated user]
+    #[arg(long)]
+    pub owner: Option<String>,
+    /// GitHub Project URL
+    #[arg(long)]
+    pub project: String,
+    /// Default base branch for new worktrees
+    #[arg(long, default_value = "main")]
+    pub base: String,
+    /// Optional Obsidian vault for the TaskNotes bridge
+    #[arg(long)]
+    pub vault: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TaskCommand {
+    /// Create an issue assigned to you and add it to the Project
+    Create {
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body_file: PathBuf,
+        /// Issue number/URL; repeat or comma-separate
+        #[arg(long)]
+        blocked_by: Vec<String>,
+        /// Also link the new issue to this vault-relative task note
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NotesCommand {
+    /// Replace an existing task note's complete set of linked GitHub issues
+    Link {
+        note: String,
+        #[arg(required = true)]
+        issues: Vec<String>,
+    },
+    /// List note associations
+    List,
+    /// Request TaskNotes completion for notes whose issues are all done
+    Complete {
+        /// Retry failed or stale requests
+        #[arg(long)]
+        retry: bool,
+    },
+    /// Copy the built plugin into the configured vault; never enable it
+    Install {
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Run `gho` with these arguments; returns the exit code.
+pub fn main(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> i32 {
+    let cli = Cli::parse_from(args);
+    let mut out = io::stdout().lock();
+    match run(cli, &System, &mut out) {
+        Ok(()) => 0,
+        Err(error) => {
+            let _ = out.flush();
+            eprintln!("gho: {error}");
+            1
+        }
+    }
+}
+
+pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+    let config_path = cli.config.map_or_else(default_config_path, |path| expand_user(&path));
+    let command = match cli.command {
+        Command::Init(args) => return init(&config_path, args, runner, out),
+        command => command,
+    };
+    let config = Config::load(&config_path)?;
+    let github = GitHub::new(&config.repo, &config.project_id, &config.owner, runner)?;
+    let workspace = Workspace::new(&config, runner);
+    match command {
+        Command::Init(_) => unreachable!("handled above"),
+        Command::Doctor => doctor(&config, &github, &workspace, out),
+        Command::Ready { all, json } => display_ready(&survey(&config, &github, &workspace)?, all, json, out),
+        Command::Worktree { issue, base } => {
+            let number = worktree_number(&config, &issue)?;
+            print_json(out, &workspace.create(number, base.as_deref())?)
+        }
+        Command::Task(TaskCommand::Create { title, body_file, blocked_by, note }) => {
+            let body = fs::read_to_string(&body_file)
+                .map_err(|error| Error::msg(format!("Cannot read {}: {error}", body_file.display())))?;
+            ensure!(!body.trim().is_empty(), "Issue body is empty.");
+            let blockers = blocked_by
+                .iter()
+                .flat_map(|group| group.split(','))
+                .map(|part| IssueRef::parse(part.trim(), Some(&config.repo)))
+                .collect::<Result<Vec<_>>>()?;
+            // Check the note before creating anything, so a bad note cannot orphan a new issue.
+            let notes = match &note {
+                Some(note) => Some((notes_for(&config)?, note_path(note)?)),
+                None => None,
+            };
+            let url = github.create_issue(&title, &body, &blockers)?.reference.url();
+            writeln!(out, "{url}")?;
+            out.flush()?;
+            if let Some((notes, note)) = notes {
+                let link = notes.add(note, &[&url]).map_err(|error| {
+                    Error::msg(format!("Issue was created at {url}; note linking failed: {error}. Do not recreate it."))
+                })?;
+                print_json(out, &link)?;
+            }
+            Ok(())
+        }
+        Command::Notes(command) => {
+            let notes = notes_for(&config)?;
+            match command {
+                NotesCommand::Link { note, issues } => {
+                    let urls = issues
+                        .iter()
+                        .map(|value| IssueRef::parse(value, Some(&config.repo)).map(|r| r.url()))
+                        .collect::<Result<Vec<_>>>()?;
+                    print_json(out, &notes.link(&note, &urls)?)
+                }
+                NotesCommand::List => print_json(out, &notes.links()?),
+                NotesCommand::Complete { retry } => complete_notes(&github, &notes, retry, out),
+                NotesCommand::Install { yes } => install_plugin(&config, yes, out),
+            }
+        }
+    }
+}
+
+fn print_json(out: &mut dyn Write, value: &impl Serialize) -> Result<()> {
+    let text = serde_json::to_string_pretty(value).map_err(|error| Error::msg(error.to_string()))?;
+    writeln!(out, "{text}")?;
+    Ok(())
+}
+
+/// Ask before a change unless `yes`. Refuses when there is nobody to ask.
+pub fn confirm(yes: bool, interactive: bool, ask: impl FnOnce() -> io::Result<String>) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    ensure!(interactive, "This action needs --yes or an interactive confirmation.");
+    let answer = ask()?.trim().to_lowercase();
+    ensure!(answer == "y" || answer == "yes", "Canceled; no change made.");
+    Ok(())
+}
+
+fn ask_terminal(message: &str, yes: bool) -> Result<()> {
+    confirm(yes, io::stdin().is_terminal(), || {
+        print!("{message} [y/N] ");
+        io::stdout().flush()?;
+        let mut line = String::new();
+        io::stdin().lock().read_line(&mut line)?;
+        Ok(line)
+    })
+}
+
+pub fn init(config_path: &Path, args: InitArgs, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+    let path = resolve(config_path)?;
+    ensure!(!path.exists(), "Config already exists: {}. Edit it directly or choose --config.", path.display());
+    let checkout = resolve(&args.checkout.unwrap_or_else(|| PathBuf::from(".")))?;
+    let remote = runner.run(&Cmd::new(["git", "remote", "get-url", "origin"]).cwd(&checkout))?;
+    let remote = github_remote_repo(remote.trim());
+    let repo = match (args.repo, &remote) {
+        (Some(repo), Some(remote)) if repo.to_lowercase() == *remote => repo,
+        (None, Some(remote)) => remote.clone(),
+        _ => bail!("Checkout origin must match a github.com repository (OWNER/REPO)."),
+    };
+    let owner = match args.owner {
+        Some(owner) => owner,
+        None => {
+            let cmd = Cmd::new(["gh", "api", "--hostname", "github.com", "user", "--jq", ".login"])
+                .env("GH_HOST", "github.com");
+            runner.run(&cmd)?.trim().to_string()
+        }
+    };
+    let project = GitHub::new(&repo, "", &owner, runner)?.resolve_project(&args.project)?;
+    let config = Config {
+        repo,
+        owner,
+        project_id: project.id,
+        project_url: project.url,
+        checkout,
+        base_branch: args.base,
+        vault: args.vault.map(|vault| resolve(&vault)).transpose()?,
+    };
+    config.validate()?;
+    let text = config.to_toml()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::OpenOptions::new().write(true).create_new(true).open(&path)?.write_all(text.as_bytes())?;
+    writeln!(
+        out,
+        "Configured {} for {}: {}\nBoard: {}\nNext: gho doctor",
+        config.repo,
+        config.owner,
+        path.display(),
+        config.project_url
+    )?;
+    Ok(())
+}
+
+fn notes_for(config: &Config) -> Result<Notes> {
+    match &config.vault {
+        Some(vault) => Notes::new(vault),
+        None => bail!("Set [obsidian].vault in your queue config first."),
+    }
+}
+
+/// The issue number for `gho worktree`, which only works on the configured repository.
+pub fn worktree_number(config: &Config, value: &str) -> Result<u64> {
+    let reference = IssueRef::parse(value, Some(&config.repo))?;
+    ensure!(reference.repo() == config.repo.to_lowercase(), "Worktrees are only created for {} issues.", config.repo);
+    Ok(reference.number())
+}
+
+pub fn display_ready(items: &[Entry], all: bool, json: bool, out: &mut dyn Write) -> Result<()> {
+    let items: Vec<&Entry> = items.iter().filter(|item| all || item.state == State::Ready).collect();
+    if json {
+        return print_json(out, &items);
+    }
+    if items.is_empty() {
+        let message =
+            if all { "Your queue is empty (open issues assigned to you in the Project)." } else { "Nothing ready." };
+        writeln!(out, "{message}")?;
+    }
+    for item in items {
+        writeln!(out, "{:<12} #{:<6} {}", item.state.label(), item.number, item.title)?;
+        if let Some(worktree) = &item.worktree {
+            writeln!(out, "{:20}{worktree}", "")?;
+        }
+        for blocker in item.blockers.iter().filter(|blocker| !blocker.done) {
+            let place = match (&blocker.branch, blocker.state) {
+                (Some(branch), _) => format!("branch {branch}"),
+                (None, IssueState::Open) => "open".into(),
+                (None, IssueState::Closed) => "closed".into(),
+            };
+            writeln!(out, "{:20}waits on {}#{} ({place})", "", blocker.repo, blocker.number)?;
+        }
+    }
+    Ok(())
+}
+
+fn doctor(config: &Config, github: &GitHub, workspace: &Workspace, out: &mut dyn Write) -> Result<()> {
+    let mut failed = false;
+    for name in ["git", "gh", "wt"] {
+        match which(name) {
+            Some(path) => writeln!(out, "OK   {name}: {}", path.display())?,
+            None => {
+                writeln!(out, "FAIL {name}: not found")?;
+                failed = true;
+            }
+        }
+    }
+    let checkout = workspace.verify_checkout();
+    if checkout.is_ok() {
+        writeln!(out, "OK   checkout {} matches {}", config.checkout.display(), config.repo)?;
+    }
+    match checkout.and_then(|()| github.queue()) {
+        Ok(queue) => {
+            writeln!(out, "OK   GitHub Project access; {} open issue(s) assigned to {}", queue.len(), config.owner)?
+        }
+        Err(error) => {
+            writeln!(out, "FAIL {error}")?;
+            failed = true;
+        }
+    }
+    ensure!(!failed, "Doctor found problems. GitHub Projects access may need: gh auth refresh -s project");
+    Ok(())
+}
+
+/// Request completion for each linked note whose issues are all completed, once per issue set.
+pub fn complete_notes(github: &dyn Issues, notes: &Notes, retry: bool, out: &mut dyn Write) -> Result<()> {
+    let links = notes.links()?;
+    if links.is_empty() {
+        writeln!(out, "No linked task notes.")?;
+        return Ok(());
+    }
+    for link in links {
+        if let Some(state) = notes.completion_state(&link)? {
+            let status = state.status.as_str();
+            if matches!(
+                state.status,
+                Status::Pending | Status::Processing | Status::LocalAccepted | Status::AlreadyDone
+            ) {
+                writeln!(out, "{}: {status}", link.note_path)?;
+                continue;
+            }
+            if !retry {
+                writeln!(out, "{}: {status}; inspect the receipt, then use --retry", link.note_path)?;
+                continue;
+            }
+        }
+        let mut open = Vec::new();
+        for url in &link.issue_urls {
+            if !github.issue(&IssueRef::parse(url, None)?)?.completed() {
+                open.push(url.as_str());
+            }
+        }
+        if !open.is_empty() {
+            writeln!(out, "Waiting: {}: not completed: {}", link.note_path, open.join(", "))?;
+            continue;
+        }
+        print_json(out, &notes.request_completion(&link)?)?;
+    }
+    Ok(())
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+fn install_plugin(config: &Config, yes: bool, out: &mut dyn Write) -> Result<()> {
+    let vault = config.vault.as_deref().expect("notes_for checked the vault");
+    ask_terminal("Copy the built GitHub Orchestrator plugin into your vault (without enabling it)?", yes)?;
+    // The plugin is built from a clone of this repository, not shipped in the binary.
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("obsidian-plugin");
+    let destination = vault.join(".obsidian/plugins/github-orchestrator");
+    let names = ["main.js", "manifest.json"];
+    ensure!(
+        names.iter().all(|name| source.join(name).is_file()),
+        "Build the optional plugin first: cd {} && npm ci && npm run build",
+        source.display()
+    );
+    ensure!(
+        !destination.ancestors().take_while(|path| *path != vault).any(is_symlink),
+        "Refusing a symlink in the plugin installation path."
+    );
+    ensure!(
+        !names.iter().any(|name| is_symlink(&destination.join(name))),
+        "Refusing to replace a symlinked plugin file."
+    );
+    fs::create_dir_all(&destination)?;
+    for name in names {
+        fs::copy(source.join(name), destination.join(name))?;
+    }
+    writeln!(out, "Installed to {}. Enable GitHub Orchestrator in Obsidian Community plugins.", destination.display())?;
+    Ok(())
+}

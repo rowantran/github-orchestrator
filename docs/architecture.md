@@ -30,12 +30,14 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 
 | Module | Responsibility |
 | --- | --- |
-| `cli.py` | Commands, argument parsing, output. |
-| `config.py` | Queue config (`[queue]`, optional `[obsidian]`) and the branch naming rule. |
-| `github.py` | GitHub reads (queue, issue, blockers, linked PRs) and issue creation, through `gh`. Missing or partial API data raises an error instead of looking like an empty queue. |
-| `work.py` | `survey()`: classify each queue issue as `ready`, `blocked` or `in_progress`. |
-| `workspace.py` | Git and Worktrunk: fetch the base, list worktrees, create the issue's worktree. |
-| `notes.py`, `obsidian-plugin/` | Optional TaskNotes bridge: note-to-issue links and completion request/receipt files. |
+| `src/cli.rs` | Commands, argument parsing (clap), output. `src/main.rs` only calls it. |
+| `src/config.rs` | Queue config (`[queue]`, optional `[obsidian]`) and the branch naming rule. Unknown keys are rejected. |
+| `src/domain.rs` | Value types: `IssueRef`, `Issue`, `PullRequest`, and the state enums. |
+| `src/github.rs` | GitHub reads (queue, issue, blockers, linked PRs) and issue creation, through `gh`. Responses are decoded into strict types, so missing or partial API data is an error instead of looking like an empty queue. |
+| `src/work.rs` | `survey()`: classify each queue issue as `ready`, `blocked` or `in_progress`. The `Issues` and `Branches` traits let tests replace GitHub and git. |
+| `src/workspace.rs` | Git and Worktrunk: fetch the base, list worktrees, create the issue's worktree. |
+| `src/process.rs` | Subprocesses as argument arrays with timeouts. The `Runner` trait lets tests replace `gh`. |
+| `src/notes.rs`, `obsidian-plugin/` | Optional TaskNotes bridge: note-to-issue links and completion request/receipt files. |
 | `agent-context/` | All model-facing text: the orchestrator skill. |
 | `package.json` | Pi package manifest, so `pi install git:github.com/rowantran/github-orchestrator` installs the skill. |
 

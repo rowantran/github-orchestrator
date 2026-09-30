@@ -20,7 +20,7 @@ const request: CompletionRequest = {
 };
 const managed = "---\ntype: task\nstatus: Not started\n---\n\n<!-- notion-task-sync:managed-start -->\n# Title\n<!-- notion-task-sync:managed-end -->\n\n## Local notes\n\nPrivate text  \n- [ ] Leave me\n";
 
-test("request fingerprint agrees with Python canonical JSON and binds exact issue set", () => {
+test("request fingerprint agrees with Rust canonical JSON and binds exact issue set", () => {
   assert.equal(fingerprint(link.issueUrls), createHash("sha256").update('["https://github.com/example/repo/issues/1","https://github.com/example/repo/issues/2"]').digest("hex"));
   assert.deepEqual(completionRequest(request), request);
   assert.equal(matchingLink(request, { schemaVersion: 1, links: [link] }), link);

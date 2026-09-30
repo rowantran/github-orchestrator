@@ -13,7 +13,7 @@ You are the orchestrator. `gho` does three fixed jobs: register work, list ready
 
 ## Setup
 
-If `gho` is not on PATH, ask the user to install it with `uv tool install git+https://github.com/rowantran/github-orchestrator`. If a command says the config is not found, help the user run `gho init --checkout REPO_PATH --project PROJECT_URL`, then `gho doctor`.
+If `gho` is not on PATH, ask the user to install it with `cargo install --locked --git https://github.com/rowantran/github-orchestrator`. If a command says the config is not found, help the user run `gho init --checkout REPO_PATH --project PROJECT_URL`, then `gho doctor`.
 
 ## Commands
 

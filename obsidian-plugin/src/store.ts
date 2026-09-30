@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { BRIDGE, ID, registry, type Registry } from "./bridge";
 
-/** Desktop-only file store. The lock protocol is shared with Python Notes. */
+/** Desktop-only file store. The lock protocol is shared with the Rust Notes in src/notes.rs. */
 export class Store {
   constructor(readonly vault: string) {}
 
