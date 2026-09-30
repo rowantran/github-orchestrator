@@ -189,13 +189,6 @@ impl Fixture {
                 return state.queue_pages.to_string();
             }
             let number: u64 = parts[4].parse().unwrap();
-            if parts.len() == 5 {
-                return rest_issue(number, &repo, OWNER).to_string();
-            }
-            if let Some(i) = args.iter().position(|a| a == "--method") {
-                assert_eq!(args[i + 1], "POST");
-                return "{}".into();
-            }
             assert!(paginated && endpoint.contains("per_page=100"));
             return state.dependencies[&(repo, number)].to_string();
         }
@@ -527,13 +520,15 @@ fn resolve_project_rejects_mismatched_project() {
 }
 
 #[test]
-fn create_issue_assigns_owner_links_explicit_project_and_uses_database_dependency_ids() {
+fn create_issue_assigns_owner_links_blockers_through_gh_and_adds_explicit_project() {
     let f = Fixture::new();
-    let blocker = issue_ref("outside/repo", 9);
-    f.add_issue(Spec { blockers: vec![blocker.clone()], ..spec(1) });
-    let created = f.github().create_issue("A title", "A body", &[blocker.clone(), blocker]).unwrap();
+    let (outside, local) = (issue_ref("outside/repo", 9), issue_ref(REPO, 3));
+    f.add_issue(Spec { blockers: vec![outside.clone(), local.clone()], ..spec(1) });
+    let blockers = [outside.clone(), local, outside];
+    let created = f.github().create_issue("A title", "A body", &blockers).unwrap();
     assert_eq!(created.reference, issue_ref(REPO, 1));
     let calls = f.calls();
+    // Each blocker once, as a full URL so cross-repository blockers resolve.
     let expected = [
         "gh",
         "issue",
@@ -546,39 +541,66 @@ fn create_issue_assigns_owner_links_explicit_project_and_uses_database_dependenc
         "A body",
         "--assignee",
         OWNER,
+        "--blocked-by",
+        "https://github.com/acme/app/issues/3",
+        "--blocked-by",
+        "https://github.com/outside/repo/issues/9",
     ];
-    assert!(calls.iter().any(|call| call == &expected));
+    assert!(calls.iter().any(|call| call == &expected), "{calls:?}");
     let url = created.reference.url();
     let add = ["gh", "project", "item-add", "7", "--owner", "acme", "--url", url.as_str(), "--format", "json"];
-    let add_index = calls.iter().position(|call| call == &add).unwrap();
-    let writes: Vec<usize> = (0..calls.len()).filter(|&i| calls[i].contains(&"POST".into())).collect();
-    assert_eq!(writes.len(), 1);
-    assert!(calls[writes[0]].contains(&"issue_id=1009".into()), "global numeric ID, not issue number 9");
-    assert!(writes[0] > add_index);
+    assert!(calls.iter().any(|call| call == &add));
+    // gh writes the dependencies; gho only reads them back.
+    assert!(!calls.iter().flatten().any(|arg| arg == "POST"));
+}
+
+#[test]
+fn create_issue_without_blockers_passes_no_blocked_by_flag() {
+    let f = Fixture::new();
+    f.add_issue(spec(1));
+    f.github().create_issue("Title", "Body", &[]).unwrap();
+    assert!(!f.calls().iter().flatten().any(|arg| arg == "--blocked-by"));
 }
 
 #[test]
 fn post_creation_failure_preserves_issue_url_and_does_not_retry() {
-    for step in ["item-add", "POST"] {
-        let f = Fixture::new();
-        f.add_issue(Spec { blockers: vec![issue_ref("outside/repo", 9)], ..spec(1) });
-        f.state().before = Box::new(move |args| args.iter().any(|a| a == step).then(|| http_error(args, "403")));
-        fails(
-            f.github().create_issue("Title", "Body", &[issue_ref("outside/repo", 9)]),
-            "Created https://github.com/acme/app/issues/1",
-        );
-        assert_eq!(f.calls().iter().filter(|call| call[1..3] == ["issue", "create"]).count(), 1, "{step}");
-    }
+    let f = Fixture::new();
+    f.add_issue(Spec { blockers: vec![issue_ref("outside/repo", 9)], ..spec(1) });
+    f.state().before = Box::new(|args| args.iter().any(|a| a == "item-add").then(|| http_error(args, "403")));
+    fails(
+        f.github().create_issue("Title", "Body", &[issue_ref("outside/repo", 9)]),
+        "Created https://github.com/acme/app/issues/1",
+    );
+    assert_eq!(f.calls().iter().filter(|call| call[1..3] == ["issue", "create"]).count(), 1);
 }
 
 #[test]
-fn inaccessible_blocker_prevents_issue_creation() {
+fn missing_blocker_link_after_creation_is_reported_for_repair() {
     let f = Fixture::new();
-    f.state().before =
-        Box::new(|args| args.iter().any(|a| a == "repos/outside/private/issues/9").then(|| http_error(args, "404")));
+    f.add_issue(spec(1)); // GitHub reports no blockers on the created issue.
+    fails(
+        f.github().create_issue("Title", "Body", &[issue_ref("outside/repo", 9)]),
+        "Created https://github.com/acme/app/issues/1, but setup is incomplete",
+    );
+}
+
+#[test]
+fn failed_gh_create_with_blockers_warns_the_issue_may_exist() {
+    let f = Fixture::new();
+    f.state().before = Box::new(|args| (args[..2] == ["issue", "create"]).then(|| http_error(args, "404")));
     let error = f.github().create_issue("Title", "Body", &[issue_ref("outside/private", 9)]).unwrap_err();
-    assert!(matches!(error, Error::Command { .. }));
-    assert!(!f.calls().iter().any(|call| call[1..3] == ["issue", "create"]));
+    let message = error.to_string();
+    assert!(message.contains("HTTP 404") && message.contains("may have created the issue"), "{message}");
+    assert!(message.contains("\"Title\"") && message.contains("do not create it twice"), "{message}");
+    assert_eq!(f.calls().iter().filter(|call| call[1..3] == ["issue", "create"]).count(), 1);
+}
+
+#[test]
+fn failed_gh_create_without_blockers_returns_the_gh_error() {
+    let f = Fixture::new();
+    f.state().before = Box::new(|args| (args[..2] == ["issue", "create"]).then(|| http_error(args, "422")));
+    let error = f.github().create_issue("Title", "Body", &[]).unwrap_err();
+    assert!(matches!(error, Error::Command { .. }), "{error:?}");
 }
 
 #[test]

@@ -12,7 +12,7 @@ GitHub is the only task store. `gho` keeps no local state: a task is "in progres
 
 ## Install and configure
 
-You need Rust (`cargo`), Git, an authenticated GitHub CLI (`gh`) with Projects scope, Worktrunk (`wt`), and Pi.
+You need Rust (`cargo`), Git, an authenticated GitHub CLI (`gh` 2.94 or later, for `--blocked-by`) with Projects scope, Worktrunk (`wt`), and Pi.
 
 ```sh
 # The gho CLI

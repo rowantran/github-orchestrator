@@ -3,7 +3,7 @@
 //! Responses are decoded into strict types: missing, null, blank or unexpected data is an error,
 //! so an inaccessible Project or a truncated page never looks like an empty queue.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Display;
 use std::num::NonZeroU64;
 use std::sync::LazyLock;
@@ -196,15 +196,6 @@ struct QueueCandidate {
     #[serde(deserialize_with = "text")]
     state: String,
     assignees: Vec<Login>,
-}
-
-#[derive(Deserialize)]
-struct BlockerTarget {
-    /// The global database ID that the dependencies API wants; not the issue number.
-    id: NonZeroU64,
-    number: NonZeroU64,
-    #[serde(deserialize_with = "text")]
-    html_url: String,
 }
 
 #[derive(Deserialize)]
@@ -500,20 +491,30 @@ impl<'a> GitHub<'a> {
         })
     }
 
-    /// Create an issue assigned to the owner, add it to the Project, and link its blockers.
+    /// Create an issue assigned to the owner and blocked by `blockers`, then add it to the Project.
     pub fn create_issue(&self, title: &str, body: &str, blockers: &[IssueRef]) -> Result<Issue> {
         let project = project_path(&self.project()?.url)?;
-        // Check every blocker before creating anything.
-        let mut dependency_ids = BTreeMap::new();
-        for blocker in blockers {
-            let value = self.api(&format!("repos/{}/issues/{}", blocker.repo(), blocker.number()), &[])?;
-            let target: BlockerTarget = rest(value, blocker.url())?;
-            check!(issue_ref(&target.html_url, target.number)? == *blocker, "blocking issue identity");
-            dependency_ids.insert(blocker.clone(), target.id);
-        }
+        let blockers: BTreeSet<&IssueRef> = blockers.iter().collect();
         let repo = format!("github.com/{}", self.repo);
-        let args = ["issue", "create", "--repo", &repo, "--title", title, "--body", body, "--assignee", &self.owner];
-        let output = self.run(&args)?;
+        let mut args: Vec<String> =
+            ["issue", "create", "--repo", &repo, "--title", title, "--body", body, "--assignee", &self.owner]
+                .map(String::from)
+                .into();
+        // gh (2.94+) resolves issue URLs to IDs and adds the native "blocked by" links itself.
+        for blocker in &blockers {
+            args.extend(["--blocked-by".into(), blocker.url()]);
+        }
+        let output = self.run(&args).map_err(|error| {
+            if blockers.is_empty() {
+                return error;
+            }
+            // gh creates the issue before linking blockers, and prints no URL if linking fails.
+            Error::msg(format!(
+                "{error}\ngh may have created the issue before this failure, without adding it to the Project. \
+                 Search {} for an issue titled {title:?} before retrying; do not create it twice.",
+                self.repo
+            ))
+        })?;
         let url = output.trim();
         let setup = || -> Result<Issue> {
             let reference = IssueRef::parse(url, None)?;
@@ -530,15 +531,10 @@ impl<'a> GitHub<'a> {
                 "json",
             ])?;
             parse::<Identified>(item, "created project item")?;
-            for id in dependency_ids.values() {
-                let endpoint =
-                    format!("repos/{}/issues/{}/dependencies/blocked_by", reference.repo(), reference.number());
-                self.api(&endpoint, &["--method", "POST", "-F", &format!("issue_id={id}")])?;
-            }
             let issue = self.issue(&reference)?;
             check!(issue.project_ids.contains(&self.project_id), "created issue project membership");
             check!(issue.assignees.iter().any(|a| a.eq_ignore_ascii_case(&self.owner)), "created issue assignee");
-            check!(dependency_ids.keys().all(|key| issue.blockers.contains(key)), "created issue dependencies");
+            check!(blockers.iter().all(|blocker| issue.blockers.contains(blocker)), "created issue dependencies");
             Ok(issue)
         };
         setup().map_err(|error| {
