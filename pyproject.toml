@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "github-orchestrator"
 version = "0.1.0"
-description = "A personal GitHub issue queue for Worktrunk and sandboxed Pi."
+description = "Find ready GitHub issues and create Worktrunk worktrees for an orchestrator agent."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["PyYAML>=6.0.2,<7"]
@@ -18,12 +18,6 @@ dev = ["pytest>=8.3,<10", "ruff>=0.11,<1"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/github_orchestrator"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"agent-context" = "github_orchestrator/agent-context"
-"pi/worker.ts" = "github_orchestrator/pi/worker.ts"
-"pi/context.ts" = "github_orchestrator/pi/context.ts"
-"pi/resources.ts" = "github_orchestrator/pi/resources.ts"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

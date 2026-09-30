@@ -5,12 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
 class OrchestratorError(Exception):
-    """An actionable error suitable for the CLI (never silently treated as readiness)."""
+    """An actionable error suitable for the CLI."""
 
 
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -74,53 +74,12 @@ class Issue:
     project_ids: tuple[str, ...] = ()
     blockers: tuple[IssueRef, ...] = ()
     pull_requests: tuple[PullRequest, ...] = ()
-    updated_at: str = ""
-    project_item_id: str | None = None
 
     @property
     def completed(self) -> bool:
         # Not-planned and duplicate closures do not mean successful delivery.
         return self.state.upper() == "CLOSED" and self.state_reason == "COMPLETED"
 
-    def plan(self) -> dict[str, Any]:
-        """Only fields that change the approved work, not comments or runtime status."""
-        return {
-            "url": self.ref.url,
-            "title": self.title,
-            "body": self.body,
-            "blockers": sorted(ref.url for ref in self.blockers),
-        }
-
 
 def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class Readiness:
-    issue: Issue
-    ready: bool
-    reason: str
-    fingerprint: str = ""
-    prerequisites: tuple[PullRequest, ...] = ()
-
-
-@dataclass
-class Run:
-    id: str
-    issue_url: str
-    fingerprint: str
-    status: str
-    branch: str
-    worktree: str
-    base_commit: str = ""
-    pid: int | None = None
-    started_at: str = ""
-    updated_at: str = ""
-    detail: str = ""
-    pr_url: str | None = None
-    commit: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def as_dict(self) -> dict[str, Any]:
-        return asdict(self)

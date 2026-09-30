@@ -14,7 +14,6 @@ REPO = "acme/app"
 PROJECT = "PVT_queue"
 OWNER = "worker"
 BRANCH = "work/issue-1"
-STATUSES = ("Draft", "Approved", "Running", "Review", "Done", "Needs input")
 
 
 def connection_pages(nodes: list[dict], size: int = 100) -> list[dict]:
@@ -39,11 +38,6 @@ def pr_node(number: int = 10, *, state: str = "OPEN", repo: str = REPO, head_rep
     }
 
 
-def status_field() -> dict:
-    return {"id": "PVTSSF_status", "name": "Status", "__typename": "ProjectV2SingleSelectField",
-            "options": [{"id": f"option-{i}", "name": name} for i, name in enumerate(STATUSES)]}
-
-
 class FixtureCommands(Commands):
     """A command-level fixture: no subprocesses, credentials, or GitHub writes."""
 
@@ -53,11 +47,7 @@ class FixtureCommands(Commands):
         self.connections: dict[tuple[str, int, str], list[dict]] = {}
         self.dependencies: dict[tuple[str, int], list[list[dict]]] = {}
         self.queue_pages: list[list[dict]] = [[]]
-        self.pr_pages = connection_pages([])
-        self.created_pr = pr_node()
         self.project = {"id": PROJECT, "url": "https://github.com/orgs/acme/projects/7", "title": "Queue"}
-        self.field_pages = connection_pages([status_field()])
-        self.status_payload: dict | None = None
         self.before: Callable[[list[str]], None] = lambda args: None
         self.graphql_errors: list[dict] = []
 
@@ -68,7 +58,7 @@ class FixtureCommands(Commands):
         self.issues[repo.lower(), number] = {
             "id": f"I_{repo}_{number}", "number": number, "url": ref.url,
             "repository": {"nameWithOwner": repo}, "title": f"Issue {number}", "body": "Details",
-            "state": state, "stateReason": reason, "updatedAt": "2026-01-01T00:00:00Z",
+            "state": state, "stateReason": reason,
             "issueDependenciesSummary": {"totalBlockedBy": len(blockers)},
         }
         self.connections[repo.lower(), number, "assignees"] = connection_pages([{"id": "U_worker", "login": assignee}])
@@ -91,19 +81,7 @@ class FixtureCommands(Commands):
                 params = dict(arg.split("=", 1) for arg in args[4:] if "=" in arg)
                 query = params["query"]
                 if "node(id:" in query:
-                    project = copy.deepcopy(self.project)
-                    if project is not None and "fields(" in query:
-                        page = int(params.get("cursor", "cursor-0").split("-")[1])
-                        project["fields"] = self.field_pages[page]
-                    data = {"node": project}
-                elif "updateProjectV2ItemFieldValue(" in query:
-                    payload = self.status_payload
-                    if payload is None:
-                        payload = {"projectV2Item": {
-                            "id": params["item"], "project": {"id": params["project"]},
-                            "fieldValueByName": {"optionId": params["option"], "field": {"id": params["field"]}},
-                        }}
-                    data = {"updateProjectV2ItemFieldValue": payload}
+                    data = {"node": copy.deepcopy(self.project)}
                 elif "issue(number:" in query:
                     repo, number = f"{params['owner']}/{params['name']}", int(params["number"])
                     issue = copy.deepcopy(self.issues.get((repo.lower(), number)))
@@ -113,9 +91,6 @@ class FixtureCommands(Commands):
                                 page = int(params.get("cursor", "cursor-0").split("-")[1])
                                 issue[field] = self.connections[repo.lower(), number, field][page]
                     data = {"repository": {"issue": issue}}
-                elif "pullRequests(" in query:
-                    page = int(params.get("cursor", "cursor-0").split("-")[1])
-                    data = {"repository": {"pullRequests": self.pr_pages[page]}}
                 else:
                     raise AssertionError(f"Unexpected GraphQL: {query}")
                 response = {"data": data}
@@ -144,12 +119,6 @@ class FixtureCommands(Commands):
             return json.dumps({"id": "PVTI_1"})
         if args[:2] == ["issue", "create"]:
             return IssueRef(REPO, 1).url + "\n"
-        if args[:2] == ["issue", "comment"]:
-            return ""
-        if args[:2] == ["pr", "create"]:
-            existing = [node for page in self.pr_pages for node in page["nodes"]]
-            self.pr_pages = connection_pages([*existing, self.created_pr])
-            return self.created_pr["url"] + "\n"
         raise AssertionError(f"Unexpected command: {argv}")
 
 
@@ -222,7 +191,6 @@ def test_issue_paginates_all_native_relationships(github, commands):
     assert issue.blockers == blockers
     assert issue.assignees == ("other", OWNER)
     assert issue.project_ids == ("PVT_other", PROJECT)
-    assert issue.project_item_id == "PVTI_correct"
     assert [pr.number for pr in issue.pull_requests] == [10, 11]
     assert issue.pull_requests[1].repo == "outside/repo"
     queries = " ".join(arg for call in commands.calls for arg in call if arg.startswith("query="))
@@ -238,10 +206,9 @@ def test_blockers_can_be_outside_queue_and_closed_is_not_always_completed(github
     issue = github.issue(ref)
     assert issue.completed is completed
     assert issue.project_ids == ()
-    assert issue.project_item_id is None
 
 
-@pytest.mark.parametrize("field", ["stateReason", "body", "title", "updatedAt", "issueDependenciesSummary", "id"])
+@pytest.mark.parametrize("field", ["stateReason", "body", "title", "issueDependenciesSummary", "id"])
 def test_missing_required_issue_metadata_fails_closed(github, commands, field):
     ref = commands.add_issue()
     del commands.issues[REPO, 1][field]
@@ -356,12 +323,9 @@ def test_resolve_project_rejects_mismatched_project(github, commands):
         github.resolve_project("https://github.com/users/worker/projects/8")
 
 
-def test_viewer_and_comment_use_only_argument_arrays(github, commands):
+def test_viewer_uses_only_argument_arrays(github, commands):
     assert github.viewer() == OWNER
-    body = "Quotes ' and $(do-not-execute)\n--flag"
-    ref = IssueRef("outside/repo", 5)
-    github.add_comment(ref, body)
-    assert commands.calls[-1] == ["gh", "issue", "comment", ref.url, "--repo", "github.com/outside/repo", "--body", body]
+    assert commands.calls[-1] == ["gh", "api", "--hostname", "github.com", "user"]
 
 
 def test_create_issue_assigns_owner_links_explicit_project_and_uses_database_dependency_ids(github, commands):
@@ -417,278 +381,9 @@ def test_issue_identity_must_match_requested_reference(github, commands):
         github.issue(ref)
 
 
-def test_pull_request_lookup_paginates_and_excludes_same_branch_in_fork(github, commands):
-    commands.pr_pages = connection_pages([pr_node(10, head_repo="fork/app"), pr_node(11, state="MERGED")], 1)
-    pr = github.pull_request(BRANCH)
-    assert pr.number == 11 and pr.merged
-    assert "cursor=cursor-1" in commands.calls[-1]
-
-
-def test_no_matching_pull_request_returns_none(github, commands):
-    assert github.pull_request(BRANCH) is None
-    commands.pr_pages = connection_pages([pr_node(head_repo="fork/app")])
-    assert github.pull_request(BRANCH) is None
-
-
-@pytest.mark.parametrize("state", ["OPEN", "CLOSED", "MERGED"])
-def test_duplicate_pull_requests_fail_instead_of_choosing_or_creating(github, commands, state):
-    commands.pr_pages = connection_pages([pr_node(10), pr_node(11, state=state)], 1)
-    with pytest.raises(OrchestratorError, match="Multiple pull requests"):
-        github.create_pull_request(BRANCH, "Title", "Body", "main")
-    assert not any(call[1:3] == ["pr", "create"] for call in commands.calls)
-
-
-@pytest.mark.parametrize("state", ["OPEN", "MERGED"])
-def test_create_pull_request_reuses_existing_request(github, commands, state):
-    commands.pr_pages = connection_pages([pr_node(state=state)])
-    assert github.create_pull_request(BRANCH, "Title", "Body", "main").number == 10
-    assert not any(call[1:3] == ["pr", "create"] for call in commands.calls)
-
-
-@pytest.mark.parametrize("state,base", [("CLOSED", "main"), ("OPEN", "different-base")])
-def test_closed_or_different_base_request_prevents_duplicate(github, commands, state, base):
-    commands.pr_pages = connection_pages([pr_node(state=state)])
-    with pytest.raises(OrchestratorError, match="no duplicate created"):
-        github.create_pull_request(BRANCH, "Title", "Body", base)
-    assert not any(call[1:3] == ["pr", "create"] for call in commands.calls)
-
-
-@pytest.mark.parametrize("branch", ["forkowner:branch", ":branch", "forkowner:"])
-def test_fork_selectors_are_rejected_before_pull_request_creation(github, commands, branch):
-    with pytest.raises(OrchestratorError, match="unqualified branch"):
-        github.create_pull_request(branch, "Title", "Body", "main")
-    assert commands.calls == []
-
-
-def test_concurrent_pull_request_to_another_base_prevents_reporting_success(github, commands):
-    def race(args):
-        if args[:2] == ["pr", "create"]:
-            competitor = pr_node(11)
-            competitor["baseRefName"] = "release"
-            commands.pr_pages = connection_pages([competitor])
-
-    commands.before = race
-    with pytest.raises(OrchestratorError, match=r"Created https://github.com/acme/app/pull/10.*Multiple pull requests"):
-        github.create_pull_request(BRANCH, "Title", "Body", "main")
-    assert sum(call[1:3] == ["pr", "create"] for call in commands.calls) == 1
-
-
-def test_failed_pull_request_lookup_prevents_creation(github, commands):
-    commands.graphql_errors = [{"message": "Resource not accessible by integration"}]
-    with pytest.raises(OrchestratorError, match="GraphQL error"):
-        github.create_pull_request(BRANCH, "Title", "Body", "main")
-    assert not any(call[1:3] == ["pr", "create"] for call in commands.calls)
-
-
-def test_create_pull_request_uses_explicit_branch_and_base_and_verifies_result(github, commands):
-    result = github.create_pull_request(BRANCH, "Title", "Body", "main")
-    assert result.number == 10 and result.head == BRANCH
-    assert ["gh", "pr", "create", "--draft", "--repo", "github.com/acme/app", "--head", BRANCH,
-            "--title", "Title", "--body", "Body", "--base", "main"] in commands.calls
-
-
-@pytest.mark.parametrize("created", [False, True])
-def test_create_pull_request_error_never_retries_write(github, commands, created):
-    def fail(args):
-        if args[:2] == ["pr", "create"]:
-            if created:
-                commands.pr_pages = connection_pages([pr_node()])
-            raise CommandError(["gh", *args], 1, "request timed out")
-
-    commands.before = fail
-    if created:
-        assert github.create_pull_request(BRANCH, "Title", "Body", "main").number == 10
-    else:
-        with pytest.raises(CommandError):
-            github.create_pull_request(BRANCH, "Title", "Body", "main")
-    assert sum(call[1:3] == ["pr", "create"] for call in commands.calls) == 1
-
-
-@pytest.mark.parametrize("field", ["headRepository", "mergeCommit", "merged", "repository", "id"])
-def test_missing_pull_request_metadata_fails_closed(github, commands, field):
-    node = pr_node(state="MERGED")
-    del node[field]
-    commands.pr_pages = connection_pages([node])
-    with pytest.raises(OrchestratorError):
-        github.pull_request(BRANCH)
-
-
 def test_inaccessible_merged_commit_fails_closed(github, commands):
     node = pr_node(state="MERGED")
     node["mergeCommit"] = None
     ref = commands.add_issue(prs=(node,))
     with pytest.raises(OrchestratorError, match="commit"):
         github.issue(ref)
-
-
-def test_created_pull_request_verification_error_preserves_url(github, commands):
-    commands.created_pr["headRepository"] = None
-    with pytest.raises(OrchestratorError, match=r"Created https://github.com/acme/app/pull/10"):
-        github.create_pull_request(BRANCH, "Title", "Body", "main")
-
-
-def status_mutations(commands):
-    return [call for call in commands.calls if any("updateProjectV2ItemFieldValue(" in arg for arg in call)]
-
-
-@pytest.mark.parametrize("status", STATUSES)
-def test_set_project_status_uses_existing_option_without_changing_field_options(github, commands, status):
-    ref = commands.add_issue()
-    assert github.set_project_status(ref, status) is True
-    writes = status_mutations(commands)
-    assert len(writes) == 1
-    assert {f"project={PROJECT}", "item=PVTI_1", "field=PVTSSF_status",
-            f"option=option-{STATUSES.index(status)}"} <= set(writes[0])
-    queries = [arg for call in commands.calls for arg in call if arg.startswith("query=")]
-    assert all("createProjectV2" not in query and "updateProjectV2Field(" not in query for query in queries)
-    assert commands.field_pages[0]["nodes"] == [status_field()]
-
-
-def test_set_project_status_paginates_fields_membership_and_assignees(github, commands):
-    ref = commands.add_issue()
-    wrong_field = {**status_field(), "id": "PVTSSF_other", "name": "status"}
-    commands.field_pages = connection_pages([wrong_field, status_field()], 1)
-    commands.connections[REPO, 1, "projectItems"] = connection_pages([
-        {"id": "PVTI_other", "project": {"id": "PVT_other"}},
-        {"id": "PVTI_correct", "project": {"id": PROJECT}},
-    ], 1)
-    commands.connections[REPO, 1, "assignees"] = connection_pages([
-        {"id": "U_other", "login": "other"}, {"id": "U_worker", "login": "WORKER"},
-    ], 1)
-    assert github.set_project_status(ref, "Running") is True
-    write = status_mutations(commands)[0]
-    assert "item=PVTI_correct" in write and "field=PVTSSF_status" in write
-    assert sum("cursor=cursor-1" in call for call in commands.calls) == 3
-
-
-@pytest.mark.parametrize("status", ["running", "Running ", "Needs Input", "Missing"])
-def test_set_project_status_returns_false_for_absent_exact_option(github, commands, status):
-    ref = commands.add_issue()
-    assert github.set_project_status(ref, status) is False
-    assert status_mutations(commands) == []
-
-
-@pytest.mark.parametrize("kind", ["absent", "case_mismatch", "wrong_type"])
-def test_set_project_status_requires_exact_single_select_status_field(github, commands, kind):
-    ref = commands.add_issue()
-    field = status_field()
-    if kind == "absent":
-        commands.field_pages = connection_pages([])
-    elif kind == "case_mismatch":
-        field["name"] = "status"
-        commands.field_pages = connection_pages([field])
-    else:
-        field["__typename"] = "ProjectV2Field"
-        commands.field_pages = connection_pages([field])
-    assert github.set_project_status(ref, "Running") is False
-    assert status_mutations(commands) == []
-
-
-def test_set_project_status_rejects_other_repository_before_commands(github, commands):
-    with pytest.raises(OrchestratorError, match="configured repository"):
-        github.set_project_status(IssueRef("other/repo", 1), "Running")
-    assert commands.calls == []
-
-
-def test_set_project_status_rejects_another_owners_issue(github, commands):
-    ref = commands.add_issue(assignee="someone-else")
-    with pytest.raises(OrchestratorError, match="configured owner"):
-        github.set_project_status(ref, "Running")
-    assert status_mutations(commands) == []
-
-
-@pytest.mark.parametrize("project", [None, "PVT_other"])
-def test_set_project_status_rejects_issue_outside_configured_project(github, commands, project):
-    ref = commands.add_issue(project=project)
-    with pytest.raises(OrchestratorError, match="membership"):
-        github.set_project_status(ref, "Running")
-    assert status_mutations(commands) == []
-
-
-def test_set_project_status_can_mirror_done_without_changing_issue_completion(github, commands):
-    ref = commands.add_issue(state="CLOSED", reason="NOT_PLANNED")
-    assert github.set_project_status(ref, "Done") is True
-    assert github.issue(ref).completed is False
-
-
-@pytest.mark.parametrize("field", ["id", "name", "__typename", "options"])
-def test_set_project_status_missing_field_metadata_raises(github, commands, field):
-    ref = commands.add_issue()
-    del commands.field_pages[0]["nodes"][0][field]
-    with pytest.raises(OrchestratorError):
-        github.set_project_status(ref, "Running")
-    assert status_mutations(commands) == []
-
-
-@pytest.mark.parametrize("options", [None, [None], [{"id": "a"}], [{"name": "Running"}],
-                                      [{"id": "a", "name": "Running"}, {"id": "b", "name": "Running"}],
-                                      [{"id": "a", "name": "Running"}, {"id": "a", "name": "Other"}]])
-def test_set_project_status_rejects_missing_or_ambiguous_options(github, commands, options):
-    ref = commands.add_issue()
-    commands.field_pages[0]["nodes"][0]["options"] = options
-    with pytest.raises(OrchestratorError):
-        github.set_project_status(ref, "Running")
-    assert status_mutations(commands) == []
-
-
-@pytest.mark.parametrize("damage", ["truncated", "missing_cursor", "duplicate_status"])
-def test_set_project_status_fails_closed_on_partial_or_ambiguous_fields(github, commands, damage):
-    ref = commands.add_issue()
-    if damage == "duplicate_status":
-        commands.field_pages = connection_pages([status_field(), {**status_field(), "id": "PVTSSF_duplicate"}], 1)
-    else:
-        page = commands.field_pages[0]
-        page["totalCount"] = 2
-        if damage == "missing_cursor":
-            page["pageInfo"] = {"hasNextPage": True, "endCursor": None}
-    with pytest.raises(OrchestratorError):
-        github.set_project_status(ref, "Running")
-    assert status_mutations(commands) == []
-
-
-@pytest.mark.parametrize("project", [None, {"id": "PVT_wrong"}])
-def test_set_project_status_requires_access_to_exact_project(github, commands, project):
-    ref = commands.add_issue()
-    commands.project = project
-    with pytest.raises(OrchestratorError):
-        github.set_project_status(ref, "Running")
-    assert status_mutations(commands) == []
-
-
-@pytest.mark.parametrize("stage", ["fields(", "updateProjectV2ItemFieldValue("])
-@pytest.mark.parametrize("failure", ["api", "graphql"])
-def test_set_project_status_api_failures_raise_instead_of_returning_false(github, commands, stage, failure):
-    ref = commands.add_issue()
-
-    def fail(args):
-        if any(stage in arg for arg in args):
-            if failure == "api":
-                raise CommandError(["gh", *args], 1, "HTTP 403 authentication failed")
-            commands.graphql_errors = [{"message": "Resource not accessible by integration"}]
-
-    commands.before = fail
-    with pytest.raises(OrchestratorError):
-        github.set_project_status(ref, "Running")
-    assert len(status_mutations(commands)) == (0 if stage == "fields(" else 1)
-
-
-@pytest.mark.parametrize("damage", ["item", "project", "field", "option", "missing_value", "missing_item"])
-def test_set_project_status_checks_mutation_result(github, commands, damage):
-    ref = commands.add_issue()
-    item = {"id": "PVTI_1", "project": {"id": PROJECT},
-            "fieldValueByName": {"optionId": "option-2", "field": {"id": "PVTSSF_status"}}}
-    if damage == "item":
-        item["id"] = "PVTI_other"
-    elif damage == "project":
-        item["project"]["id"] = "PVT_other"
-    elif damage == "field":
-        item["fieldValueByName"]["field"]["id"] = "PVTSSF_other"
-    elif damage == "option":
-        item["fieldValueByName"]["optionId"] = "option-3"
-    elif damage == "missing_value":
-        item["fieldValueByName"] = None
-    else:
-        item = None
-    commands.status_payload = {"projectV2Item": item}
-    with pytest.raises(OrchestratorError):
-        github.set_project_status(ref, "Running")

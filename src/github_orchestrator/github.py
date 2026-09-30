@@ -208,7 +208,7 @@ class GitHub:
     def issue(self, ref: IssueRef) -> Issue:
         # Deliberately not restricted to this queue: blockers can be anywhere.
         data = self._issue_data(ref, """
-            title body state stateReason updatedAt issueDependenciesSummary { totalBlockedBy }
+            title body state stateReason issueDependenciesSummary { totalBlockedBy }
         """)
         state = _text(data, "state")
         _check(state in {"OPEN", "CLOSED"}, "issue state")
@@ -219,8 +219,7 @@ class GitHub:
         assignees = self._issue_connection(ref, "assignees", "id login")
         items = self._issue_connection(ref, "projectItems", "id project { id }", ", includeArchived: true")
         projects = [_text(_object(item.get("project"), "item project"), "id") for item in items]
-        matching = [item["id"] for item, project in zip(items, projects) if project == self.project_id]
-        _check(len(matching) <= 1, "duplicate project membership")
+        _check(projects.count(self.project_id) <= 1, "duplicate project membership")
         closing = self._issue_connection(ref, "closedByPullRequestsReferences", _PR_FIELDS, ", includeClosedPrs: true")
         blockers = [self._rest_ref(node) for node in self._rest_pages(
             f"repos/{ref.repo}/issues/{ref.number}/dependencies/blocked_by?per_page=100"
@@ -233,72 +232,7 @@ class GitHub:
             state=state, state_reason=reason, assignees=tuple(_text(a, "login") for a in assignees),
             project_ids=tuple(projects), blockers=tuple(blockers),
             pull_requests=tuple(self._pull_request(node) for node in closing),
-            updated_at=_text(data, "updatedAt"), project_item_id=matching[0] if matching else None,
         )
-
-    def set_project_status(self, ref: IssueRef, status: str) -> bool:
-        """Mirror status using existing options only; project status is not readiness evidence."""
-        _check(ref.repo.lower() == self.repo.lower(), "status updates require the configured repository")
-        _check(bool(self.project_id.strip()), "explicit project ID is required")
-        _check(isinstance(status, str) and bool(status.strip()), "status name")
-        issue = self.issue(ref)
-        _check(self.owner.lower() in {a.lower() for a in issue.assignees},
-               "status updates require an issue assigned to the configured owner")
-        _check(self.project_id in issue.project_ids and issue.project_item_id is not None,
-               "status updates require membership in the configured project")
-        query = f"""
-            query($id: ID!, $cursor: String) {{ node(id: $id) {{ ... on ProjectV2 {{
-                id fields(first: 100, after: $cursor) {{ {_PAGE} nodes {{
-                    __typename ... on ProjectV2FieldCommon {{ id name }}
-                    ... on ProjectV2SingleSelectField {{ options {{ id name }} }}
-                }} }}
-            }} }} }}
-        """
-
-        def fetch(cursor: str | None) -> dict:
-            data = self._graphql(query, id=self.project_id, cursor=cursor)
-            project = _object(data.get("node"), "project fields")
-            _check(_text(project, "id") == self.project_id, "project ID")
-            return project.get("fields")
-
-        fields = self._connection(fetch)
-        for field in fields:
-            _text(field, "__typename")
-        matches = [field for field in fields if _text(field, "name") == "Status"]
-        _check(len(matches) <= 1, "ambiguous Status field")
-        if not matches or matches[0]["__typename"] != "ProjectV2SingleSelectField":
-            return False
-        field = matches[0]
-        options = field.get("options")
-        _check(isinstance(options, list), "Status options")
-        options = [(_text(_object(option, "Status option"), "id"), _text(option, "name")) for option in options]
-        _check(len({identifier for identifier, _ in options}) == len(options), "duplicate Status option ID")
-        matching_options = [identifier for identifier, name in options if name == status]
-        _check(len(matching_options) <= 1, "ambiguous Status option")
-        if not matching_options:
-            return False
-        option_id = matching_options[0]
-        data = self._graphql("""
-            mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
-                updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item,
-                    fieldId: $field, value: {singleSelectOptionId: $option}}) {
-                    projectV2Item { id project { id } fieldValueByName(name: "Status") {
-                        ... on ProjectV2ItemFieldSingleSelectValue {
-                            optionId field { ... on ProjectV2FieldCommon { id } }
-                        }
-                    } }
-                }
-            }
-        """, project=self.project_id, item=issue.project_item_id, field=field["id"], option=option_id)
-        payload = _object(data.get("updateProjectV2ItemFieldValue"), "status update")
-        item = _object(payload.get("projectV2Item"), "updated project item")
-        _check(_text(item, "id") == issue.project_item_id, "updated project item ID")
-        _check(_text(_object(item.get("project"), "updated item project"), "id") == self.project_id,
-               "updated item project ID")
-        value = _object(item.get("fieldValueByName"), "updated Status value")
-        _check(_text(_object(value.get("field"), "updated Status field"), "id") == field["id"]
-               and _text(value, "optionId") == option_id, "updated Status option")
-        return True
 
     def create_issue(self, title: str, body: str, blockers: tuple[IssueRef, ...] = ()) -> Issue:
         project = self._project()
@@ -333,9 +267,6 @@ class GitHub:
                 f"Created {ref.url}, but setup is incomplete: {exc}. Repair this issue; do not recreate it."
             ) from exc
 
-    def add_comment(self, ref: IssueRef, body: str) -> None:
-        self._run(["issue", "comment", ref.url, "--repo", f"github.com/{ref.repo}", "--body", body])
-
     @staticmethod
     def _pull_request(data: dict) -> PullRequest:
         _text(data, "id")
@@ -356,64 +287,3 @@ class GitHub:
         return PullRequest(number=number, url=url, state=state, merged=merged,
                            base=_text(data, "baseRefName"), head=_text(data, "headRefName"),
                            merge_commit=oid, repo=repo)
-
-    def pull_request(self, branch: str) -> PullRequest | None:
-        _check(isinstance(branch, str) and bool(branch.strip()) and ":" not in branch,
-               "unqualified branch name (not an owner:branch fork selector)")
-        owner, name = self.repo.split("/")
-        query = f"""
-            query($owner: String!, $name: String!, $branch: String!, $cursor: String) {{
-                repository(owner: $owner, name: $name) {{
-                    pullRequests(first: 100, after: $cursor, headRefName: $branch,
-                                 states: [OPEN, CLOSED, MERGED]) {{ {_PAGE} nodes {{ {_PR_FIELDS} }} }}
-                }}
-            }}
-        """
-
-        def fetch(cursor: str | None) -> dict:
-            data = self._graphql(query, owner=owner, name=name, branch=branch, cursor=cursor)
-            return _object(data.get("repository"), self.repo).get("pullRequests")
-
-        matches = []
-        for node in self._connection(fetch):
-            pr = self._pull_request(node)
-            _check(pr.repo.lower() == self.repo.lower(), "pull request repository")
-            head_repo = _text(_object(node.get("headRepository"), "pull request head repository"), "nameWithOwner")
-            if pr.head == branch and head_repo.lower() == self.repo.lower():
-                matches.append(pr)
-        if len(matches) > 1:
-            raise OrchestratorError(f"Multiple pull requests use {self.repo}:{branch}; refusing to choose or create another.")
-        return matches[0] if matches else None
-
-    @staticmethod
-    def _existing_pr(pr: PullRequest, base: str) -> PullRequest:
-        if pr.base != base or (pr.state == "CLOSED" and not pr.merged):
-            raise OrchestratorError(f"Existing pull request {pr.url} has a different base or is closed; no duplicate created.")
-        return pr
-
-    def create_pull_request(self, branch: str, title: str, body: str, base: str) -> PullRequest:
-        existing = self.pull_request(branch)
-        if existing:
-            return self._existing_pr(existing, base)
-        try:
-            url = self._run([
-                "pr", "create", "--draft", "--repo", f"github.com/{self.repo}", "--head", branch,
-                "--title", title, "--body", body, "--base", base,
-            ]).strip()
-        except OrchestratorError:
-            # A competing creator or a timeout may leave a PR behind. Never retry
-            # the write; recover only an unambiguous PR with the expected base.
-            existing = self.pull_request(branch)
-            if existing:
-                return self._existing_pr(existing, base)
-            raise
-        match = _PR_URL.fullmatch(url)
-        _check(match is not None and match[1].lower() == self.repo.lower(), f"created pull request URL: {url}")
-        try:
-            # A competing PR to another base can appear after the preflight check.
-            # Recheck the whole branch, not just the newly created PR number.
-            pr = self.pull_request(branch)
-            _check(pr is not None and pr.url == url, "created pull request identity")
-            return self._existing_pr(pr, base)
-        except OrchestratorError as exc:
-            raise OrchestratorError(f"Created {url}, but could not verify the pull request: {exc}") from exc

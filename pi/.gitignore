@@ -1,2 +1,0 @@
-# Purpose: exclude development dependencies. Audience: Git and maintainers. Injection: none.
-node_modules/
