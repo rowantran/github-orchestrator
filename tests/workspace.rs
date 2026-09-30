@@ -60,6 +60,7 @@ fn repository() -> Repository {
         checkout,
         base_branch: "main".into(),
         vault: None,
+        agents: Default::default(),
     };
     Repository { _dir: dir, config, seed }
 }

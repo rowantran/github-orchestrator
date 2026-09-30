@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use crate::config::{Config, default_config_path};
+use crate::config::{Agents, Config, default_config_path};
 use crate::domain::{IssueRef, StateReason};
 use crate::github::GitHub;
 use crate::notes::{Notes, Status, note_path};
@@ -34,6 +34,8 @@ pub enum Command {
     Init(InitArgs),
     /// Check git, gh, wt and GitHub Project access
     Doctor,
+    /// Print the loaded config, including the agent models, as JSON
+    Config,
     /// List queue issues that are ready to start (blockers done, or ready for review to stack on)
     Ready {
         /// Also list blocked, in-progress and ready-for-review issues
@@ -79,6 +81,12 @@ pub struct InitArgs {
     /// Optional Obsidian vault for the TaskNotes bridge
     #[arg(long)]
     pub vault: Option<PathBuf>,
+    /// Pi model pattern for implementer agents, e.g. anthropic/claude-opus-4-5:high
+    #[arg(long)]
+    pub implementer_model: Option<String>,
+    /// Pi model pattern for reviewer agents
+    #[arg(long)]
+    pub reviewer_model: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -142,10 +150,13 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
         command => command,
     };
     let config = Config::load(&config_path)?;
+    if let Command::Config = command {
+        return print_json(out, &config);
+    }
     let github = GitHub::new(&config.repo, &config.project_id, &config.owner, runner)?;
     let workspace = Workspace::new(&config, runner);
     match command {
-        Command::Init(_) => unreachable!("handled above"),
+        Command::Init(_) | Command::Config => unreachable!("handled above"),
         Command::Doctor => doctor(&config, &github, &workspace, out),
         Command::Ready { all, json } => display_ready(&survey(&config, &github, &workspace)?, all, json, out),
         Command::Worktree { issue, base } => {
@@ -257,6 +268,7 @@ pub fn init(config_path: &Path, args: InitArgs, runner: &dyn Runner, out: &mut d
         checkout,
         base_branch: args.base,
         vault: args.vault.map(|vault| resolve(&vault)).transpose()?,
+        agents: Agents { implementer_model: args.implementer_model, reviewer_model: args.reviewer_model },
     };
     config.validate()?;
     let text = config.to_toml()?;
@@ -391,6 +403,14 @@ fn doctor(config: &Config, github: &GitHub, workspace: &Workspace, out: &mut dyn
         Err(error) => {
             writeln!(out, "FAIL {error}")?;
             failed = true;
+        }
+    }
+    for (role, model) in
+        [("implementer", &config.agents.implementer_model), ("reviewer", &config.agents.reviewer_model)]
+    {
+        match model {
+            Some(model) => writeln!(out, "OK   {role} model: {model}")?,
+            None => writeln!(out, "WARN {role} model: not set; add {role}_model under [agents] in the config")?,
         }
     }
     ensure!(!failed, "Doctor found problems. GitHub Projects access may need: gh auth refresh -s project");

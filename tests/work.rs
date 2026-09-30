@@ -116,6 +116,7 @@ fn config() -> Config {
         checkout: PathBuf::from("/nonexistent"),
         base_branch: "main".into(),
         vault: None,
+        agents: Default::default(),
     }
 }
 

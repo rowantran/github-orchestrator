@@ -6,7 +6,7 @@
 2. **Find ready work:** list open issues in your queue that you can start: every blocker is done, or has an open pull request to stack on.
 3. **Create a worktree:** make branch `<owner>/gh-N` for a ready issue in a new Worktrunk worktree, from the latest base branch or stacked on its blockers' pull requests.
 
-The agent you talk to does everything else: it launches implementer agents in the worktrees, steers them, reviews their work, and pushes or opens PRs when you ask. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells it how; this repository is a Pi package that ships it.
+The agent you talk to does everything else. It launches an implementer agent in each worktree, in its own tmux window. The implementer first writes a skeleton (pseudocode and stubs at the real paths) and agrees on it with you in that window. Then it implements the change and opens a draft PR, and the orchestrator launches a reviewer agent on it. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells the orchestrator how; `implementer.md` and `reviewer.md` next to it are the other agents' standing instructions. This repository is a Pi package that ships them.
 
 GitHub is the only task store. `gho` keeps no local state: a task is "in progress" when its branch exists, and "ready for review" when an open pull request comes from that branch.
 
@@ -27,6 +27,16 @@ gho doctor
 
 `--repo` defaults to the checkout's GitHub `origin` and `--owner` to the authenticated user. `--base` sets the default base branch (`main`). Add `--vault /path/to/vault` to use the optional Obsidian bridge.
 
+`--implementer-model` and `--reviewer-model` set the Pi models (`--model` patterns such as `anthropic/claude-opus-4-5:high`) that the orchestrator launches agents with, instead of your Pi default. You can also set them later in the config:
+
+```toml
+[agents]
+implementer_model = "anthropic/claude-opus-4-5:high"
+reviewer_model = "openai/gpt-5"
+```
+
+`gho config` prints the loaded config as JSON; `gho doctor` warns when a model is not set.
+
 The config is written to `~/.config/github-orchestrator/config.toml`. Override it with `GHO_CONFIG` or `gho --config PATH`. Worktrees go wherever your Worktrunk configuration puts them.
 
 To update later: rerun the `cargo install` command and `pi update`.
@@ -41,6 +51,7 @@ gho ready --json            # ready issues; --all adds blocked, in-progress and 
 gho worktree 42             # new worktree from the latest origin/main
 gho worktree 43             # ready with stack_on [42]: starts from origin/rowantran/gh-42
 gho worktree 44 --base rowantran/gh-42   # start any issue, ready or not, from an explicit branch or commit
+gho config                  # config as JSON, including agents.implementer_model and agents.reviewer_model
 ```
 
 **States.** `gho` classifies every issue, in this order:

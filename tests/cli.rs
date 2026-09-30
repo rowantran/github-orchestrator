@@ -60,6 +60,8 @@ impl Initialized {
             project: PROJECT.into(),
             base: "main".into(),
             vault: Some(self.root().join("vault")),
+            implementer_model: Some("anthropic/claude-opus-4-5:high".into()),
+            reviewer_model: None,
         }
     }
 }
@@ -86,6 +88,8 @@ fn init_round_trip_and_no_overwrite() {
     assert_eq!(config.vault, Some(state.root().join("vault")));
     assert!(!state.root().join("vault").exists());
     assert_eq!(config.branch(42), "Owner/gh-42");
+    assert_eq!(config.agents.implementer_model.as_deref(), Some("anthropic/claude-opus-4-5:high"));
+    assert_eq!(config.agents.reviewer_model, None);
     let before = fs::read(&state.config).unwrap();
     let error = cli::init(&state.config, state.args(), &state.runner, &mut Vec::new()).unwrap_err();
     assert!(error.to_string().contains("already exists"));
@@ -104,6 +108,8 @@ fn invalid_config_has_actionable_error() {
         ("project_id = \"PVT_queue\"", "project_id = 7"),
         ("base_branch = \"main\"", "base_branch = \"../x\""),
         ("base_branch = \"main\"", "base_branch = \"main\"\nbase-branch = \"typo\""),
+        ("implementer_model = \"anthropic/claude-opus-4-5:high\"", "implementer_model = \"opus; rm -rf /\""),
+        ("implementer_model = \"anthropic/claude-opus-4-5:high\"", "implementer-model = \"opus\""),
     ];
     for (old, new) in cases {
         let state = initialized();
@@ -116,6 +122,21 @@ fn invalid_config_has_actionable_error() {
         assert_eq!(output.status.code(), Some(1), "{stderr}");
         assert!(stderr.starts_with("gho: Invalid config") && !stderr.contains("panicked"), "{stderr}");
     }
+}
+
+#[test]
+fn config_prints_agent_models_without_touching_github() {
+    let state = initialized();
+    let original = fs::read_to_string(&state.config).unwrap();
+    fs::write(&state.config, format!("{original}reviewer_model = \"openai/gpt-5\"\n")).unwrap();
+    let output = run_binary(&["--config", state.config.to_str().unwrap(), "config"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["repo"], "acme/app");
+    assert_eq!(
+        value["agents"],
+        json!({"implementer_model": "anthropic/claude-opus-4-5:high", "reviewer_model": "openai/gpt-5"})
+    );
 }
 
 #[test]
@@ -405,7 +426,7 @@ fn help_lists_commands() {
     let output = run_binary(&["--help"]);
     assert!(output.status.success());
     let help = String::from_utf8(output.stdout).unwrap();
-    for command in ["init", "doctor", "ready", "worktree", "task", "notes"] {
+    for command in ["init", "doctor", "config", "ready", "worktree", "task", "notes"] {
         assert!(help.contains(command), "{help}");
     }
     let _ = Cli::parse_from(["gho", "ready", "--all", "--json"]);
