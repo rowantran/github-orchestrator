@@ -82,6 +82,8 @@ struct State {
     connections: HashMap<(String, u64, &'static str), Vec<Value>>,
     /// A list of pages per issue; a `Value` so tests can damage the shape.
     dependencies: HashMap<Key, Value>,
+    /// Open pull request connection pages by head branch; `None` makes the repository inaccessible.
+    branch_prs: Option<HashMap<String, Vec<Value>>>,
     queue_pages: Value,
     project: Value,
     before: Hook,
@@ -98,6 +100,7 @@ impl Fixture {
             issues: HashMap::new(),
             connections: HashMap::new(),
             dependencies: HashMap::new(),
+            branch_prs: Some(HashMap::new()),
             queue_pages: json!([[]]),
             project: json!({"id": PROJECT, "url": "https://github.com/orgs/acme/projects/7", "title": "Queue"}),
             before: Box::new(|_| None),
@@ -168,6 +171,18 @@ impl Fixture {
                         }
                     }
                     json!({"repository": {"issue": issue}})
+                } else if query.contains("pullRequests(headRefName: $branch, states: [OPEN]") {
+                    assert_eq!(format!("{}/{}", params["owner"], params["name"]), REPO);
+                    match &state.branch_prs {
+                        None => json!({"repository": null}),
+                        Some(prs) => {
+                            let cursor = params.get("cursor").copied().unwrap_or("cursor-0");
+                            let page: usize = cursor.split('-').nth(1).unwrap().parse().unwrap();
+                            let pages =
+                                prs.get(params["branch"]).cloned().unwrap_or_else(|| connection_pages(vec![], 100));
+                            json!({"repository": {"pullRequests": pages[page]}})
+                        }
+                    }
                 } else {
                     panic!("Unexpected GraphQL: {query}");
                 };
@@ -632,4 +647,45 @@ fn state_reasons_decode() {
     let f = Fixture::new();
     let reference = f.add_issue(Spec { state: "CLOSED", reason: json!("NOT_PLANNED"), ..spec(1) });
     assert_eq!(f.github().issue(&reference).unwrap().state_reason, Some(StateReason::NotPlanned));
+}
+
+fn branch_pr(number: u64, head: &str, head_repo: Option<&str>) -> Value {
+    let mut pr = pr_node(number, "OPEN", REPO);
+    pr["headRefName"] = json!(head);
+    pr["headRepository"] = head_repo.map_or(Value::Null, |repo| json!({"nameWithOwner": repo}));
+    pr
+}
+
+#[test]
+fn open_pull_request_is_found_by_head_branch_in_this_repository() {
+    let f = Fixture::new();
+    let prs = vec![
+        branch_pr(7, "worker/gh-1", Some("stranger/app")), // a fork's branch with the same name
+        branch_pr(8, "worker/gh-1", None),                 // deleted fork
+        branch_pr(9, "worker/gh-1", Some("ACME/App")),
+    ];
+    f.state().branch_prs = Some(HashMap::from([("worker/gh-1".into(), connection_pages(prs, 2))]));
+    let pr = f.github().open_pull_request("worker/gh-1").unwrap().unwrap();
+    assert_eq!((pr.number, pr.head.as_str(), pr.state), (9, "worker/gh-1", PullRequestState::Open));
+    assert_eq!(f.github().open_pull_request("worker/gh-2").unwrap(), None);
+}
+
+#[test]
+fn several_open_pull_requests_from_one_branch_are_an_error() {
+    let f = Fixture::new();
+    let prs = vec![branch_pr(8, "worker/gh-1", Some(REPO)), branch_pr(9, "worker/gh-1", Some(REPO))];
+    f.state().branch_prs = Some(HashMap::from([("worker/gh-1".into(), connection_pages(prs, 100))]));
+    fails(f.github().open_pull_request("worker/gh-1"), "More than one open pull request from worker/gh-1");
+}
+
+#[test]
+fn open_pull_request_lookup_fails_closed() {
+    let f = Fixture::new();
+    f.state().branch_prs = None;
+    fails(f.github().open_pull_request("worker/gh-1"), "pull requests");
+
+    let f = Fixture::new();
+    let prs = vec![branch_pr(9, "worker/gh-other", Some(REPO))];
+    f.state().branch_prs = Some(HashMap::from([("worker/gh-1".into(), connection_pages(prs, 100))]));
+    fails(f.github().open_pull_request("worker/gh-1"), "pull request for worker/gh-1");
 }

@@ -3,12 +3,12 @@
 `gho` is a small CLI that an orchestrator agent uses to work through your GitHub issue queue. It does three things:
 
 1. **Register work:** create GitHub issues assigned to you, added to your Project, with native "blocked by" links.
-2. **Find ready work:** list open issues in your queue whose blockers are all closed as completed.
-3. **Create a worktree:** make branch `<owner>/gh-N` in a new Worktrunk worktree, from the latest base or stacked on another branch.
+2. **Find ready work:** list open issues in your queue that you can start: every blocker is done, or has an open pull request to stack on.
+3. **Create a worktree:** make branch `<owner>/gh-N` for a ready issue in a new Worktrunk worktree, from the latest base branch or stacked on its blockers' pull requests.
 
 The agent you talk to does everything else: it launches implementer agents in the worktrees, steers them, reviews their work, and pushes or opens PRs when you ask. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells it how; this repository is a Pi package that ships it.
 
-GitHub is the only task store. `gho` keeps no local state: a task is "in progress" when its branch exists.
+GitHub is the only task store. `gho` keeps no local state: a task is "in progress" when its branch exists, and "ready for review" when an open pull request comes from that branch.
 
 ## Install and configure
 
@@ -37,12 +37,26 @@ Start Pi as usual. It lists the `github-orchestrator` skill and loads it when yo
 
 ```sh
 gho task create --title "One bounded change" --body-file task.md --blocked-by 41
-gho ready --json            # ready issues; --all adds blocked and in-progress ones
+gho ready --json            # ready issues; --all adds blocked, in-progress and ready-for-review ones
 gho worktree 42             # new worktree from the latest origin/main
-gho worktree 43 --base rowantran/gh-42   # stack on unmerged work
+gho worktree 43             # ready with stack_on [42]: starts from origin/rowantran/gh-42
+gho worktree 44 --base rowantran/gh-42   # start any issue, ready or not, from an explicit branch or commit
 ```
 
-**Readiness rule:** an issue is ready when it is open, assigned to you, in the Project, has no `<owner>/gh-N` branch yet, and every blocker is closed as *completed*. Blockers closed as not planned or duplicate do not count. For blocked issues, `gho ready --all --json` shows each blocker's local branch, worktree and linked PRs, so the orchestrator can stack on them.
+**States.** `gho` classifies every issue, in this order:
+
+| State | Meaning |
+| --- | --- |
+| `done` | Closed as *completed*. |
+| `closed` | Closed as not planned or duplicate. Never unblocks dependents. |
+| `ready_for_review` | An open pull request (draft or not) comes from `<owner>/gh-N`. |
+| `in_progress` | The branch `<owner>/gh-N` exists locally, with no open pull request. |
+| `ready` | No branch yet, and every blocker is `done` or `ready_for_review`. |
+| `blocked` | Anything else. |
+
+Only `ready` issues can be picked up. A ready issue's `stack_on` lists its blockers that are ready for review, bottom first; `gho worktree N` starts from the last one's branch, or from the latest base branch when the list is empty. Blockers under review must lie on one chain of pull requests (each based on the branch below it), because a branch can only start from one of them; otherwise the issue is blocked. `gho` finds pull requests by head branch, because GitHub does not link stacked pull requests to issues through "Closes #N". Only issues in the configured repository have branches, so blockers elsewhere are never `in_progress` or `ready_for_review`.
+
+`gho ready` lists open issues assigned to you in the Project, with each blocker's state, local branch, worktree and pull requests. `gho worktree N` refuses issues that are not ready unless you pass `--base`.
 
 ## Optional TaskNotes bridge
 

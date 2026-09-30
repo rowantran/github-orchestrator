@@ -9,12 +9,12 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::config::{Config, default_config_path};
-use crate::domain::{IssueRef, IssueState};
+use crate::domain::{IssueRef, StateReason};
 use crate::github::GitHub;
 use crate::notes::{Notes, Status, note_path};
 use crate::paths::{expand_user, resolve};
 use crate::process::{Cmd, Runner, System, which};
-use crate::work::{Entry, Issues, State, survey};
+use crate::work::{Blocker, Entry, Issues, State, classify, survey};
 use crate::workspace::{Workspace, github_remote_repo};
 use crate::{Error, Result, bail, ensure};
 
@@ -34,19 +34,20 @@ pub enum Command {
     Init(InitArgs),
     /// Check git, gh, wt and GitHub Project access
     Doctor,
-    /// List queue issues whose blockers are all done
+    /// List queue issues that are ready to start (blockers done, or ready for review to stack on)
     Ready {
-        /// Also list blocked and in-progress issues
+        /// Also list blocked, in-progress and ready-for-review issues
         #[arg(long)]
         all: bool,
         #[arg(long)]
         json: bool,
     },
-    /// Create the issue's branch and worktree; prints JSON
+    /// Create a ready issue's branch and worktree; prints JSON
     Worktree {
         /// Issue number or URL
         issue: String,
-        /// Branch or commit to stack on (default: latest origin/<base branch>)
+        /// Branch or commit to start from, even if the issue is not ready [default: only ready issues; the top of
+        /// their stack of blockers under review, else latest origin/<base branch>]
         #[arg(long)]
         base: Option<String>,
     },
@@ -149,6 +150,13 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
         Command::Ready { all, json } => display_ready(&survey(&config, &github, &workspace)?, all, json, out),
         Command::Worktree { issue, base } => {
             let number = worktree_number(&config, &issue)?;
+            let base = match base {
+                Some(base) => Some(base),
+                None => {
+                    let entry = classify(&config, &github, &workspace, &IssueRef::new(&config.repo, number)?)?;
+                    stack_branch(&config, &entry)?.map(|branch| workspace.fetch(&branch)).transpose()?
+                }
+            };
             print_json(out, &workspace.create(number, base.as_deref())?)
         }
         Command::Task(TaskCommand::Create { title, body_file, blocked_by, note }) => {
@@ -281,8 +289,57 @@ pub fn worktree_number(config: &Config, value: &str) -> Result<u64> {
     Ok(reference.number())
 }
 
+/// The blocker branch to start a ready issue from without `--base`: the top of its stack of blockers
+/// under review, or `None` for the latest base branch. Refuses issues that are not ready.
+pub fn stack_branch(config: &Config, entry: &Entry) -> Result<Option<String>> {
+    match &entry.state {
+        State::Ready { stack_on } => Ok(stack_on.last().map(|&top| config.branch(top))),
+        state => bail!("{} Use --base to start it anyway.", not_ready(entry.number, state, entry)),
+    }
+}
+
+/// Why issue `number` cannot be started.
+fn not_ready(number: u64, state: &State, entry: &Entry) -> String {
+    match state {
+        State::Ready { .. } => unreachable!("ready issues can start"),
+        State::Blocked => {
+            let waits: Vec<String> = entry
+                .blockers
+                .iter()
+                .filter(|blocker| blocker.state != State::Done)
+                .map(|blocker| format!("{}#{} ({})", blocker.repo, blocker.number, blocker_place(blocker)))
+                .collect();
+            format!("Issue #{number} is blocked: it waits on {}.", waits.join(", "))
+        }
+        State::InProgress => match &entry.worktree {
+            Some(worktree) => format!("Issue #{number} is already in progress in {worktree}."),
+            None => format!("Issue #{number} is already in progress on branch {}.", entry.branch),
+        },
+        State::ReadyForReview { pull_request } => {
+            format!(
+                "Issue #{number} already has an open pull request: {}. Continue on {}.",
+                pull_request.url, pull_request.head
+            )
+        }
+        State::Done => format!("Issue #{number} is already done."),
+        State::Closed { .. } => format!("Issue #{number} is closed without being completed."),
+    }
+}
+
+/// A blocker's state in words, for `gho ready` and refusals.
+fn blocker_place(blocker: &Blocker) -> String {
+    match (&blocker.state, &blocker.branch) {
+        (State::ReadyForReview { pull_request }, _) => format!("ready for review: {}", pull_request.url),
+        (State::InProgress, Some(branch)) => format!("in progress on {branch}"),
+        (State::Ready { .. }, _) => "not started".into(),
+        (State::Closed { reason: Some(StateReason::Duplicate) }, _) => "closed as duplicate".into(),
+        (State::Closed { .. }, _) => "closed as not planned".into(),
+        (state, _) => state.label().to_lowercase().replace('_', " "),
+    }
+}
+
 pub fn display_ready(items: &[Entry], all: bool, json: bool, out: &mut dyn Write) -> Result<()> {
-    let items: Vec<&Entry> = items.iter().filter(|item| all || item.state == State::Ready).collect();
+    let items: Vec<&Entry> = items.iter().filter(|item| all || item.state.is_ready()).collect();
     if json {
         return print_json(out, &items);
     }
@@ -292,17 +349,21 @@ pub fn display_ready(items: &[Entry], all: bool, json: bool, out: &mut dyn Write
         writeln!(out, "{message}")?;
     }
     for item in items {
-        writeln!(out, "{:<12} #{:<6} {}", item.state.label(), item.number, item.title)?;
+        writeln!(out, "{:<16} #{:<6} {}", item.state.label(), item.number, item.title)?;
         if let Some(worktree) = &item.worktree {
-            writeln!(out, "{:20}{worktree}", "")?;
+            writeln!(out, "{:25}{worktree}", "")?;
         }
-        for blocker in item.blockers.iter().filter(|blocker| !blocker.done) {
-            let place = match (&blocker.branch, blocker.state) {
-                (Some(branch), _) => format!("branch {branch}"),
-                (None, IssueState::Open) => "open".into(),
-                (None, IssueState::Closed) => "closed".into(),
-            };
-            writeln!(out, "{:20}waits on {}#{} ({place})", "", blocker.repo, blocker.number)?;
+        match &item.state {
+            State::ReadyForReview { pull_request } => writeln!(out, "{:25}review {}", "", pull_request.url)?,
+            State::Ready { stack_on } if !stack_on.is_empty() => {
+                let stack: Vec<String> = stack_on.iter().map(|n| format!("#{n}")).collect();
+                writeln!(out, "{:25}stacks on {}", "", stack.join(" → "))?;
+            }
+            _ => {}
+        }
+        for blocker in item.blockers.iter().filter(|blocker| blocker.state != State::Done) {
+            let place = blocker_place(blocker);
+            writeln!(out, "{:25}waits on {}#{} ({place})", "", blocker.repo, blocker.number)?;
         }
     }
     Ok(())

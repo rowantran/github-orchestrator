@@ -138,6 +138,23 @@ fn worktree_can_stack_on_unmerged_branch() {
 }
 
 #[test]
+fn fetch_returns_the_latest_pushed_branch_to_stack_on() {
+    // Stacking on a blocker that is ready for review starts from its pushed branch, even with no local copy.
+    let repo = repository();
+    git(&repo.seed, &["switch", "-q", "-c", "rowantran/gh-1"]);
+    let pushed = commit(&repo.seed, "feature.txt", "blocker work under review");
+    git(&repo.seed, &["push", "-q", "origin", "rowantran/gh-1"]);
+    let workspace = Workspace::new(&repo.config, &System);
+    assert_eq!(workspace.fetch("rowantran/gh-1").unwrap(), "origin/rowantran/gh-1");
+    assert_eq!(git(&repo.config.checkout, &["rev-parse", "origin/rowantran/gh-1"]), pushed);
+    assert!(!workspace.branch_exists("rowantran/gh-1").unwrap());
+    if has_wt() {
+        let stacked = workspace.create(2, Some("origin/rowantran/gh-1")).unwrap();
+        assert_eq!(stacked.base_commit, pushed);
+    }
+}
+
+#[test]
 fn existing_branch_is_reported_not_replaced() {
     if !has_wt() {
         return;

@@ -131,6 +131,9 @@ struct PullRequestNode {
     #[serde(deserialize_with = "present")]
     merge_commit: Option<Commit>,
     repository: Repository,
+    /// Null when the head repository (for example a fork) was deleted.
+    #[serde(deserialize_with = "present")]
+    head_repository: Option<Repository>,
 }
 
 impl Node for Assignee {
@@ -489,6 +492,50 @@ impl<'a> GitHub<'a> {
             blockers,
             pull_requests: closing.into_iter().map(pull_request).collect::<Result<_>>()?,
         })
+    }
+
+    /// The open pull request (draft or not) from `branch` in this repository, if any.
+    ///
+    /// Found by head branch, not by closing keywords: GitHub ignores "Closes #N" on pull requests
+    /// that target a branch other than the default branch, so stacked pull requests are never linked.
+    pub fn open_pull_request(&self, branch: &str) -> Result<Option<PullRequest>> {
+        let (owner, name) = self.repo.split_once('/').expect("validated OWNER/REPO");
+        let query = format!(
+            "query($owner: String!, $name: String!, $branch: String!, $cursor: String) {{ \
+             repository(owner: $owner, name: $name) {{ \
+             pullRequests(headRefName: $branch, states: [OPEN], first: 100, after: $cursor) {{ \
+             totalCount pageInfo {{ hasNextPage endCursor }} nodes {{ {PR_FIELDS} }} }} }} }}"
+        );
+        let nodes: Vec<PullRequestNode> = paginate(|cursor| {
+            let mut variables =
+                vec![("owner", Var::Str(owner)), ("name", Var::Str(name)), ("branch", Var::Str(branch))];
+            if let Some(cursor) = cursor {
+                variables.push(("cursor", Var::Str(cursor)));
+            }
+            let mut data = self.graphql(&query, &variables)?;
+            let connection = data.pointer_mut("/repository/pullRequests").map(Value::take).unwrap_or_default();
+            parse(connection, "pull requests (check repository access)")
+        })?;
+        let repo = self.repo.to_lowercase();
+        let mut found = Vec::new();
+        for node in nodes {
+            // A fork's branch with the same name is someone else's work.
+            let head = node.head_repository.as_ref().map(|r| r.name_with_owner.to_lowercase());
+            let pr = pull_request(node)?;
+            check!(pr.state == PullRequestState::Open && pr.head == branch, "pull request for {branch}");
+            check!(pr.repo.to_lowercase() == repo, "pull request repository");
+            if head.as_deref() == Some(repo.as_str()) {
+                found.push(pr);
+            }
+        }
+        if found.len() > 1 {
+            let urls: Vec<&str> = found.iter().map(|pr| pr.url.as_str()).collect();
+            return Err(Error::msg(format!(
+                "More than one open pull request from {branch}: {}. Close the extras.",
+                urls.join(", ")
+            )));
+        }
+        Ok(found.pop())
     }
 
     /// Create an issue assigned to the owner and blocked by `blockers`, then add it to the Project.

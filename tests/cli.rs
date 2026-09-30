@@ -7,10 +7,10 @@ use std::process::Command;
 use clap::Parser;
 use github_orchestrator::cli::{self, Cli, InitArgs};
 use github_orchestrator::config::Config;
-use github_orchestrator::domain::{Issue, IssueRef, IssueState, StateReason};
+use github_orchestrator::domain::{Issue, IssueRef, IssueState, PullRequest, PullRequestState, StateReason};
 use github_orchestrator::notes::Notes;
 use github_orchestrator::process::{Cmd, Runner};
-use github_orchestrator::work::{Blocker, Entry, Issues, State};
+use github_orchestrator::work::{Blocker, Entry, Issues, LinkedPullRequest, State};
 use github_orchestrator::{Error, Result};
 use serde_json::json;
 use tempfile::TempDir;
@@ -177,43 +177,100 @@ fn entry(number: u64, title: &str, state: State, worktree: Option<&str>, blocker
     }
 }
 
-fn items() -> Vec<Entry> {
-    let blocker = Blocker {
-        number: 1,
+fn in_review(number: u64) -> State {
+    State::ReadyForReview {
+        pull_request: LinkedPullRequest {
+            url: format!("https://github.com/acme/app/pull/{number}0"),
+            state: PullRequestState::Open,
+            head: format!("Owner/gh-{number}"),
+            base: "main".into(),
+        },
+    }
+}
+
+fn blocker(number: u64, state: State, branch: Option<&str>) -> Blocker {
+    Blocker {
+        number,
         repo: "acme/app".into(),
-        url: "https://github.com/acme/app/issues/1".into(),
-        title: "Ready one".into(),
-        done: false,
-        state: IssueState::Open,
-        state_reason: None,
-        branch: Some("Owner/gh-1".into()),
+        url: format!("https://github.com/acme/app/issues/{number}"),
+        title: format!("Issue {number}"),
+        state,
+        branch: branch.map(Into::into),
         worktree: None,
         pull_requests: vec![],
-    };
+    }
+}
+
+fn items() -> Vec<Entry> {
     vec![
-        entry(1, "Ready one", State::Ready, None, vec![]),
-        entry(2, "Blocked one", State::Blocked, None, vec![blocker]),
+        entry(1, "Ready one", State::Ready { stack_on: vec![] }, None, vec![]),
+        entry(
+            2,
+            "Blocked one",
+            State::Blocked,
+            None,
+            vec![
+                blocker(1, State::InProgress, Some("Owner/gh-1")),
+                blocker(6, State::Closed { reason: Some(StateReason::Duplicate) }, None),
+                blocker(7, State::Done, None),
+            ],
+        ),
         entry(3, "Working", State::InProgress, Some("/w/3"), vec![]),
+        entry(4, "In review", in_review(4), None, vec![]),
+        entry(5, "Stacked", State::Ready { stack_on: vec![4] }, None, vec![blocker(4, in_review(4), None)]),
     ]
 }
 
 #[test]
-fn ready_lists_only_ready_work_unless_all() {
+fn ready_lists_ready_work_including_stacks_unless_all() {
     let mut out = Vec::new();
     cli::display_ready(&items(), false, true, &mut out).unwrap();
     let listed: serde_json::Value = serde_json::from_slice(&out).unwrap();
     let numbers: Vec<u64> = listed.as_array().unwrap().iter().map(|i| i["number"].as_u64().unwrap()).collect();
-    assert_eq!(numbers, [1]);
+    assert_eq!(numbers, [1, 5]);
+    assert_eq!(listed[1]["stack_on"], json!([4]));
 
     let mut out = Vec::new();
     cli::display_ready(&items(), true, false, &mut out).unwrap();
     let out = String::from_utf8(out).unwrap();
-    assert!(out.contains("READY") && out.contains("BLOCKED") && out.contains("IN_PROGRESS"), "{out}");
-    assert!(out.contains("waits on acme/app#1 (branch Owner/gh-1)") && out.contains("/w/3"), "{out}");
+    for label in ["READY ", "BLOCKED", "IN_PROGRESS", "READY_FOR_REVIEW"] {
+        assert!(out.contains(label), "{label}: {out}");
+    }
+    assert!(out.contains("waits on acme/app#1 (in progress on Owner/gh-1)") && out.contains("/w/3"), "{out}");
+    assert!(out.contains("waits on acme/app#6 (closed as duplicate)") && !out.contains("#7"), "{out}");
+    assert!(out.contains("review https://github.com/acme/app/pull/40"), "{out}");
+    assert!(out.contains("stacks on #4"), "{out}");
+    assert!(out.contains("waits on acme/app#4 (ready for review: https://github.com/acme/app/pull/40)"), "{out}");
 
     let mut out = Vec::new();
     cli::display_ready(&[], false, false, &mut out).unwrap();
     assert_eq!(String::from_utf8(out).unwrap(), "Nothing ready.\n");
+}
+
+#[test]
+fn worktree_without_base_starts_only_ready_issues() {
+    let state = initialized();
+    let config = Config::load(&state.config).unwrap();
+    let items = items();
+    assert_eq!(cli::stack_branch(&config, &items[0]).unwrap(), None);
+    // Top of the stack; `gho worktree` fetches it and starts from origin/<branch>.
+    let top = entry(8, "Two deep", State::Ready { stack_on: vec![4, 5] }, None, vec![]);
+    assert_eq!(cli::stack_branch(&config, &top).unwrap().as_deref(), Some("Owner/gh-5"));
+
+    let refused = |entry: &Entry| cli::stack_branch(&config, entry).unwrap_err().to_string();
+    let blocked = refused(&items[1]);
+    assert!(
+        blocked.starts_with(
+            "Issue #2 is blocked: it waits on acme/app#1 (in progress on Owner/gh-1), acme/app#6 (closed as duplicate)."
+        ),
+        "{blocked}"
+    );
+    assert!(blocked.ends_with("Use --base to start it anyway."), "{blocked}");
+    assert!(refused(&items[2]).contains("already in progress in /w/3"));
+    assert!(refused(&items[3]).contains("already has an open pull request: https://github.com/acme/app/pull/40"));
+    assert!(refused(&entry(9, "Done", State::Done, None, vec![])).contains("already done"));
+    let closed = entry(9, "Closed", State::Closed { reason: Some(StateReason::NotPlanned) }, None, vec![]);
+    assert!(refused(&closed).contains("closed without being completed"));
 }
 
 #[test]
@@ -264,6 +321,10 @@ impl Issues for FakeGitHub {
             blockers: vec![],
             pull_requests: vec![],
         })
+    }
+
+    fn open_pull_request(&self, _branch: &str) -> Result<Option<PullRequest>> {
+        Err(Error::msg("unused"))
     }
 }
 

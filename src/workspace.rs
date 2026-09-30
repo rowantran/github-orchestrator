@@ -80,6 +80,12 @@ impl<'a> Workspace<'a> {
         Ok(result)
     }
 
+    /// Fetch `branch` from origin; returns the remote-tracking name to start from, `origin/<branch>`.
+    pub fn fetch(&self, branch: &str) -> Result<String> {
+        self.git(&["fetch", "origin", branch], 300)?;
+        Ok(format!("origin/{branch}"))
+    }
+
     /// Create the issue's branch and worktree from the latest base branch, or on top of `base` to stack.
     pub fn create(&self, number: u64, base: Option<&str>) -> Result<Created> {
         let branch = self.config.branch(number);
@@ -92,10 +98,7 @@ impl<'a> Workspace<'a> {
         }
         let base = match base {
             Some(base) => base.to_string(),
-            None => {
-                self.git(&["fetch", "origin", &self.config.base_branch], 300)?;
-                format!("origin/{}", self.config.base_branch)
-            }
+            None => self.fetch(&self.config.base_branch)?,
         };
         let commit = self
             .git(&["rev-parse", "--verify", &format!("{base}^{{commit}}")], 60)
