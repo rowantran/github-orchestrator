@@ -104,6 +104,7 @@ pub struct PullRequest {
     pub url: String,
     pub repo: String,
     pub state: PullRequestState,
+    pub draft: bool,
     pub base: String,
     pub head: String,
     /// Present exactly when the pull request is merged.

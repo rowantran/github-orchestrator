@@ -11,7 +11,7 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
         │ gho config           → agent models from the config
         ▼
    implementer agents, one per worktree, each in a tmux window
-   (skeleton → draft PR → agreed with you in PR comments → implementation pushed to the PR)
+   (skeleton → draft PR → agreed with you in PR comments → implementation → PR published)
         │
         ▼
    reviewer agent per PR → orchestrator relays findings → you review and merge
@@ -22,7 +22,7 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 | Owner | Responsibility |
 | --- | --- |
 | GitHub | Tasks: title, body, assignee, Project membership, blockers, open/closed and close reason. |
-| Git checkout | Work in progress: branch `<owner>/gh-N` and its worktree. Once pushed with an open PR, the issue is ready for review. |
+| Git checkout | Work in progress: branch `<owner>/gh-N` and its worktree. With an open draft PR, the issue is still in progress; once the PR is published (not a draft), it is ready for review. |
 | `gho` | Reads the two above to classify issues; creates issues and worktrees. No local database. |
 | Orchestrator agent | Which tasks to start, launching and managing implementers, retries, stacking, review, publishing. |
 | You | Plan approval, what to run, when to publish, merging. |
@@ -48,8 +48,9 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 - **No lifecycle management in code.** Launching, monitoring and retrying implementers is left to the orchestrator agent, so it can handle edge cases and choose how to run each implementer. The `[agents]` models are only stored and printed by `gho`; the orchestrator passes them to Pi.
 - **Config files are the only way to configure.** `gho init` takes no options. It creates missing config files with what it can infer (your login from `gh`, the base branch from `origin/HEAD`), and the user edits them. Settings shared by every repository are global; each repository's Project and base branch are in its own file, kept with the global one instead of in the repository because they are personal. The files hold only values a person can read and write: the Project is set by URL, and `gho` looks up its ID when it needs it.
 - **The working directory selects the repository.** The checkout and repository are never configured: `gho` uses the git checkout it runs in and the GitHub repository of its `origin`, so one installation serves every repository.
-- **No local state.** "In progress" means the issue's branch exists; "ready for review" means an open PR comes from it. Deleting the branch (`wt remove -D`) makes an issue without a PR ready again.
+- **No local state.** "In progress" means the issue's branch exists or a draft PR comes from it; "ready for review" means an open PR that is not a draft comes from it. Deleting the branch (`wt remove -D`) makes an issue without a PR ready again.
 - **Only ready work starts.** An issue is ready when every blocker is done or ready for review. Blockers under review must form one chain of PRs, and the new branch starts from the top of it (`origin/<branch>`), so stacks build on pushed work that others can see. `gho worktree N` refuses other issues; `--base` is the explicit override.
 - **The brief is deterministic.** `gho worktree` writes each issue's task brief from a template, so every agent gets the same facts in the same form, and the orchestrator does not write briefs itself. The brief lives in the worktree, in a self-ignoring `.gho/` directory, so it needs no shared Git configuration and is removed with the worktree.
+- **Publishing a PR is the hand-off.** Implementers open a draft PR early, to review the skeleton on GitHub. A draft is unfinished work, so it does not count as ready for review and does not unblock dependents; marking the PR ready for review does. The workflow does not depend on agents remembering to ignore draft PRs.
 - **PRs are found by branch.** GitHub ignores closing keywords on PRs that target a non-default branch, so a stacked PR is never linked to its issue. `gho` looks up open PRs by head branch `<owner>/gh-N` in the configured repository instead.
 - **Completed means `COMPLETED`.** Issues closed as not planned or duplicate never unblock dependents or complete notes.

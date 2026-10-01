@@ -17,7 +17,7 @@ You decide the rest with the user: which tasks to create, how to launch and stee
 Run `gho` inside the repository's checkout or one of its worktrees: it works on the GitHub repository of the checkout's `origin`. If it reports a missing config, ask the user to run `gho init` there and fill in the file it names.
 
 - `gho task create --title TITLE --body-file FILE [--blocked-by N]... [--note VAULT_PATH]`: create an issue assigned to the user, add it to the configured project, and record native "blocked by" dependency information. Use this when breaking up the plan into a series of issues.
-- `gho ready --json`: Use this when determining which issue (if any) to start next. Add `--all` to also see `blocked`, `in_progress` (branch exists, no PR) and `ready_for_review` (open PR, in `pull_request`) issues.
+- `gho ready --json`: Use this when determining which issue (if any) to start next. Add `--all` to also see `blocked`, `in_progress` (branch exists or draft PR open) and `ready_for_review` (published PR, in `pull_request`) issues.
 - `gho worktree N [--base REF]`: Use this once ready to start implementing issue N. It uses Worktrunk (`wt`) to create a branch `<owner>/gh-N` in a new worktree for a ready issue, and writes the task brief for the issue's agents to `.gho/brief.md` in the worktree (Git ignores it). It prints JSON with the worktree `path`, the `brief` path, and the `base_branch` that the pull request will target.
 - `gho config`: prints the user's `gho` config as JSON. `agents.implementer_model` and `agents.reviewer_model` are the Pi models to launch agents with.
 
@@ -38,7 +38,6 @@ Once the plan is complete:
 1. Run `gho ready --json` and agree with the user which issues to start and how many at once, unless they already said.
 2. Run `gho worktree N` for each one.
    - Generally, only start issues that are ready, with or without pending dependencies that they need to be stacked on.
-   - An implementer opens its draft PR as soon as it commits the skeleton, so `gho` shows the issue as `ready_for_review` and its dependents as `ready` while the PR holds only the skeleton. Do not start a dependent until each blocker in its `stack_on` has its implementation pushed.
    - In certain situations, we may want to start a non-ready issue anyway (for example if it depends on two disjoint issues that are both in review separately, so the CLI detects it as not ready, but  we want to merge those two dependencies into a new base branch so we can start anyways). In that case, ask the user first, then use `gho worktree N --base <branch>`.
 3. Run `gho config` to get the configured implementer / reviewer models. If a model is not set, just omit the `--model` option when launching the agents.
 4. Launch one implementer per worktree in a new tmux window titled "#N: <short-slug-version-of-issue-title>", with the worktree as its working directory. Give it the brief that `gho worktree` wrote as its first message, unchanged. Run Pi interactively (no `-p`), so the user can discuss with the implementer in that window:
@@ -50,4 +49,4 @@ Once the plan is complete:
 
    Use absolute paths. Do not pass the path of `implementer.md` or the brief directly: if Pi cannot read the file, it silently uses the path itself as the prompt text.
 5. Watch progress for all active implementers. Answer other questions, steer (`tmux send-keys -t <window> '<message>' Enter`), stop, or relaunch as needed. Bubble up to the user for information when facing ambiguity that you can't safely resolve on your own. The user reviews the pseudocode skeleton in comments on the implementer's draft PR. When an implementer opens that PR, give the user its URL. Do NOT approve the skeleton yourself, and do not comment on the PR: the implementer uses the same GitHub account as the user, and treats every comment without the `[agent:]` prefix as a comment from the user.
-6. When an implementer reports that it pushed its implementation to the draft PR (its Phase 4), launch a reviewer in the same worktree the same way, but with `--model <reviewer_model>`, `reviewer.md`, and "Review " prepended to the window title.
+6. When an implementer publishes its PR (marks it ready for review, so the issue shows as `ready_for_review`), launch a reviewer in the same worktree the same way, but with `--model <reviewer_model>`, `reviewer.md`, and "Review " prepended to the window title.

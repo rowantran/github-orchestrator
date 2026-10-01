@@ -41,10 +41,15 @@ fn open_pr(number: u64, head: &str, base: &str) -> PullRequest {
         url: format!("https://github.com/acme/app/pull/{number}"),
         repo: REPO.into(),
         state: PullRequestState::Open,
+        draft: false,
         base: base.into(),
         head: head.into(),
         merge_commit: None,
     }
+}
+
+fn draft_pr(number: u64, head: &str, base: &str) -> PullRequest {
+    PullRequest { draft: true, ..open_pr(number, head, base) }
 }
 
 struct FakeGitHub {
@@ -207,6 +212,7 @@ fn blocked_issue_reports_blocker_branches_and_pull_requests() {
             [LinkedPullRequest {
                 url: pr.url,
                 state: PullRequestState::Open,
+                draft: false,
                 head: "someone/feature".into(),
                 base: "main".into()
             }]
@@ -241,6 +247,27 @@ fn open_pull_request_from_the_branch_means_ready_for_review() {
             ("https://github.com/acme/app/pull/50", "owner/gh-5")
         );
     }
+}
+
+#[test]
+fn draft_pull_request_from_the_branch_means_in_progress() {
+    // With or without a local branch: the issue is not ready for review until the pull request is published.
+    for branches in [&["owner/gh-5"][..], &[]] {
+        let github = FakeGitHub::new(vec![issue(5, &[])], vec![]).with_reviews(&[draft_pr(50, "owner/gh-5", "main")]);
+        let items = survey(&config(), &github, &FakeWorkspace::with(&[], branches)).unwrap();
+        assert_eq!(items[0].state, State::InProgress);
+    }
+}
+
+#[test]
+fn blockers_with_draft_pull_requests_block_dependents() {
+    let github = FakeGitHub::new(vec![issue(1, &[]), issue(2, &blocked_by(&[1]))], vec![]).with_reviews(&[draft_pr(
+        10,
+        "owner/gh-1",
+        "main",
+    )]);
+    let items = survey(&config(), &github, &FakeWorkspace::default()).unwrap();
+    assert_eq!(states(&items), [(1, State::InProgress), (2, State::Blocked)]);
 }
 
 #[test]

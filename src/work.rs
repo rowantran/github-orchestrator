@@ -63,9 +63,10 @@ pub enum State {
     /// `stack_on` lists the blockers that are ready for review, bottom of the stack first; the new
     /// branch starts from the last one's branch. Empty: start from the base branch.
     Ready { stack_on: Vec<u64> },
-    /// The issue's branch exists (gho worktree ran, or someone made it by hand), with no open pull request.
+    /// The issue's branch exists (gho worktree ran, or someone made it by hand) with no published pull
+    /// request, or an open draft pull request comes from it.
     InProgress,
-    /// An open pull request (draft or not) comes from the issue's branch.
+    /// An open pull request that is not a draft comes from the issue's branch.
     ReadyForReview { pull_request: LinkedPullRequest },
     /// Closed as completed.
     Done,
@@ -125,13 +126,20 @@ pub struct Blocker {
 pub struct LinkedPullRequest {
     pub url: String,
     pub state: PullRequestState,
+    pub draft: bool,
     pub head: String,
     pub base: String,
 }
 
 impl From<&PullRequest> for LinkedPullRequest {
     fn from(pr: &PullRequest) -> Self {
-        LinkedPullRequest { url: pr.url.clone(), state: pr.state, head: pr.head.clone(), base: pr.base.clone() }
+        LinkedPullRequest {
+            url: pr.url.clone(),
+            state: pr.state,
+            draft: pr.draft,
+            head: pr.head.clone(),
+            base: pr.base.clone(),
+        }
     }
 }
 
@@ -200,7 +208,7 @@ impl<'a> Classifier<'a> {
         Ok(if self.workspace.branch_exists(&branch)? { (Some(branch), None) } else { (None, None) })
     }
 
-    /// The open pull request from issue `number`'s branch in this repository.
+    /// The open pull request (draft or not) from issue `number`'s branch in this repository.
     fn review(&mut self, number: u64) -> Result<Option<LinkedPullRequest>> {
         if let Some(review) = self.reviews.get(&number) {
             return Ok(review.clone());
@@ -236,7 +244,8 @@ impl<'a> Classifier<'a> {
         }
         let local = issue.reference.repo() == self.repo;
         if local && let Some(pull_request) = self.review(issue.reference.number())? {
-            return Ok(State::ReadyForReview { pull_request });
+            // A draft is still being worked on, so it neither counts as review nor unblocks dependents.
+            return Ok(if pull_request.draft { State::InProgress } else { State::ReadyForReview { pull_request } });
         }
         if self.local(&issue.reference)?.0.is_some() {
             return Ok(State::InProgress);

@@ -55,16 +55,19 @@ Replace the skeleton with the real implementation. Keep to the approved skeleton
 
 Run the verification commands from the issue and fix any failures. Commit your work on this branch.
 
-## Phase 4: Update the pull request
+## Phase 4: Publish the pull request
 
-Push the implementation to the same branch, and replace the pull request body. Keep the pull request as a draft.
+Push the implementation to the same branch, replace the pull request body, and mark the pull request as ready for review:
 
 ```sh
 git push
 gh pr edit <PR number> --body-file <file>
+gh pr ready <PR number>
 ```
 
 The new body must give a short summary of the change, reference the issue (`Closes #N`), and list the checks you ran with their results.
+
+Publish the pull request only when the implementation is complete and the checks pass. While the pull request is a draft, the task stays in progress; publishing it moves the task to ready for review, which lets other tasks stack on your branch.
 
 Then report a summary in this terminal: what you changed, where you deviated from the approved skeleton and why, the checks you ran with results, the pull request URL, and anything that blocked you.
 
@@ -73,32 +76,3 @@ After that, continue to watch the pull request. Address new comments from the us
 ## Use the pull request for review
 
 **Prefix every comment that you write on GitHub with `[agent:]`**: pull request comments, replies to review comments, and review bodies. For example: `[agent:] Done in abc1234: the balance check now runs before the notification.` You use the same GitHub account as the user, so this prefix is the only way to tell your comments from theirs. Treat every comment without the prefix as a comment from the user, and ignore every comment with the prefix.
-
-Use the GitHub CLI for all comments:
-
-- Reply to a general pull request comment or to a review summary: `gh pr comment <PR number> --body-file <file>`.
-- Reply to an inline review comment in its own thread: `gh api "repos/{owner}/{repo}/pulls/<PR number>/comments/<comment id>/replies" -F body=@<file>`. Use the `id` of the top comment of the thread (its `in_reply_to_id`, if it has one).
-
-Answer each comment from the user. If the comment asks a question, answer it. If it asks for a change, make the change, push it, and name the commit in your reply. If you disagree, say why and wait for the user's decision.
-
-Record each comment that you handled by appending its `key` to `.gho/handled-comments` (`.gho/` is ignored by Git). To wait for new comments, run this command. It checks every 60 seconds, prints the user's comments that you have not handled, one JSON object per line, and stops after 30 minutes with no output. Run it again until the user's next comment arrives.
-
-```sh
-pr=<PR number>
-touch .gho/handled-comments
-for _ in $(seq 30); do
-  new=$({
-    gh api --paginate "repos/{owner}/{repo}/issues/$pr/comments" \
-      --jq '.[] | {key: "comment-\(.id)", body, url: .html_url}'
-    gh api --paginate "repos/{owner}/{repo}/pulls/$pr/reviews" \
-      --jq '.[] | select(.body != "" or .state == "APPROVED") | {key: "review-\(.id)", state, body, url: .html_url}'
-    gh api --paginate "repos/{owner}/{repo}/pulls/$pr/comments" \
-      --jq '.[] | {key: "inline-\(.id)", id, in_reply_to_id, path, line, body, url: .html_url}'
-  } | jq -c --rawfile seen .gho/handled-comments \
-      'select((.body | startswith("[agent:]") | not) and (.key as $k | $seen | split("\n") | any(. == $k) | not))')
-  if [ -n "$new" ]; then echo "$new"; break; fi
-  sleep 60
-done
-```
-
-If the user writes to you in this terminal, answer in this terminal.
