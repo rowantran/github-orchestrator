@@ -4,13 +4,16 @@
 pub mod brief;
 pub mod cli;
 pub mod config;
+pub mod dashboard;
 pub mod domain;
 pub mod error;
 pub mod github;
 pub mod notes;
 pub mod paths;
 pub mod process;
+pub mod tmux;
 pub mod work;
 pub mod workspace;
+pub mod workstreams;
 
 pub use error::{Error, Result};

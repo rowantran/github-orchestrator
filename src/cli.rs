@@ -16,7 +16,7 @@ use crate::paths::{expand_user, resolve};
 use crate::process::{Cmd, Runner, System, which};
 use crate::work::{Blocker, Entry, Issues, State, classify, survey};
 use crate::workspace::{Created, Workspace, locate, origin_default_branch};
-use crate::{Error, Result, bail, brief, ensure};
+use crate::{Error, Result, bail, brief, dashboard, ensure, workstreams};
 
 #[derive(Debug, Parser)]
 #[command(name = "gho", version, about = "Your GitHub issue queue → ready work → Worktrunk worktrees.")]
@@ -57,6 +57,18 @@ pub enum Command {
     /// Register work as GitHub issues
     #[command(subcommand)]
     Task(TaskCommand),
+    /// Manage overlapping groups of tasks, stored as GitHub labels
+    #[command(subcommand)]
+    Workstream(WorkstreamCommand),
+    /// Serve a local dependency graph of all tasks in this repository's Project
+    Dashboard {
+        /// Loopback port; 0 chooses an available port
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Restrict pane discovery and focus to this exact tmux session name
+        #[arg(long)]
+        tmux_session: Option<String>,
+    },
     /// Optional TaskNotes bridge
     #[command(subcommand)]
     Notes(NotesCommand),
@@ -73,9 +85,35 @@ pub enum TaskCommand {
         /// Issue number/URL; repeat or comma-separate
         #[arg(long)]
         blocked_by: Vec<String>,
+        /// Add the issue to an existing workstream; repeat for overlapping groups
+        #[arg(long)]
+        workstream: Vec<String>,
         /// Also link the new issue to this vault-relative task note
         #[arg(long)]
         note: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkstreamCommand {
+    /// Create a named workstream (idempotent); slash-separated names have no implicit inheritance
+    Create { name: String },
+    /// List all workstreams, including empty groups
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add issues to a workstream without changing other memberships
+    Add {
+        name: String,
+        #[arg(required = true)]
+        issues: Vec<String>,
+    },
+    /// Remove issues from just this workstream
+    Remove {
+        name: String,
+        #[arg(required = true)]
+        issues: Vec<String>,
     },
 }
 
@@ -149,7 +187,11 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
             })?;
             print_json(out, &Started { created, brief })
         }
-        Command::Task(TaskCommand::Create { title, body_file, blocked_by, note }) => {
+        Command::Dashboard { port, tmux_session } => {
+            dashboard::serve(&config, runner, port, tmux_session.as_deref(), out)
+        }
+        Command::Workstream(command) => run_workstream(command, &config, &github, out),
+        Command::Task(TaskCommand::Create { title, body_file, blocked_by, workstream, note }) => {
             let body = fs::read_to_string(&body_file)
                 .map_err(|error| Error::msg(format!("Cannot read {}: {error}", body_file.display())))?;
             ensure!(!body.trim().is_empty(), "Issue body is empty.");
@@ -158,6 +200,19 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
                 .flat_map(|group| group.split(','))
                 .map(|part| IssueRef::parse(part.trim(), Some(&config.repo)))
                 .collect::<Result<Vec<_>>>()?;
+            // Validate every membership before creating an issue. A typo must not orphan a task.
+            if !workstream.is_empty() {
+                for name in &workstream {
+                    workstreams::label(name)?;
+                }
+                let known = github.workstreams()?;
+                for name in &workstream {
+                    ensure!(
+                        known.iter().any(|known| known.eq_ignore_ascii_case(name)),
+                        "Unknown workstream {name:?}. Run gho workstream create first."
+                    );
+                }
+            }
             // Check the note before creating anything, so a bad note cannot orphan a new issue.
             let notes = match &note {
                 Some(note) => Some((notes_for(&config)?, note_path(note)?)),
@@ -166,6 +221,12 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
             let url = github.create_issue(&title, &body, &blockers)?.reference.url();
             writeln!(out, "{url}")?;
             out.flush()?;
+            let reference = IssueRef::parse(&url, None)?;
+            for name in &workstream {
+                github.add_to_workstream(name, std::slice::from_ref(&reference)).map_err(|error| {
+                    Error::msg(format!("Created {url}, but workstream {name:?} linking failed: {error}. Repair this issue; do not recreate it."))
+                })?;
+            }
             if let Some((notes, note)) = notes {
                 let link = notes.add(note, &[&url]).map_err(|error| {
                     Error::msg(format!("Issue was created at {url}; note linking failed: {error}. Do not recreate it."))
@@ -190,6 +251,41 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
             }
         }
     }
+}
+
+fn run_workstream(command: WorkstreamCommand, config: &Config, github: &GitHub, out: &mut dyn Write) -> Result<()> {
+    let add = matches!(&command, WorkstreamCommand::Add { .. });
+    match command {
+        WorkstreamCommand::Create { name } => {
+            github.create_workstream(&name)?;
+            writeln!(out, "Workstream available: {name}")?;
+        }
+        WorkstreamCommand::List { json } => {
+            let names = github.workstreams()?;
+            if json {
+                return print_json(out, &names);
+            }
+            if names.is_empty() {
+                writeln!(out, "No workstreams. Create one with gho workstream create NAME.")?;
+            }
+            for name in names {
+                writeln!(out, "{name}")?;
+            }
+        }
+        WorkstreamCommand::Add { name, issues } | WorkstreamCommand::Remove { name, issues } => {
+            let mut references =
+                issues.iter().map(|value| IssueRef::parse(value, Some(&config.repo))).collect::<Result<Vec<_>>>()?;
+            references.sort();
+            references.dedup();
+            if add {
+                github.add_to_workstream(&name, &references)?;
+            } else {
+                github.remove_from_workstream(&name, &references)?;
+            }
+            writeln!(out, "Updated {} issue(s) in workstream {name:?}.", references.len())?;
+        }
+    }
+    Ok(())
 }
 
 /// The result of `gho worktree`.

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="gho-token" content="__GHO_TOKEN__">
+  <meta name="color-scheme" content="light">
+  <title>Task graph · GitHub Orchestrator</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#graph-viewport">Skip to task graph</a>
+  <header class="app-header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">g</span><div><strong>GitHub Orchestrator</strong><span class="brand-subtitle">Local task dashboard</span></div></div>
+    <div class="header-actions"><span class="local-badge"><span aria-hidden="true"></span>Local session</span><a id="project-link" class="text-link" hidden target="_blank" rel="noopener noreferrer">Open project ↗</a></div>
+  </header>
+  <main class="app-layout">
+    <aside class="sidebar" aria-label="Task filters and status legend">
+      <div class="repo-block"><span class="eyebrow">Repository</span><h1 id="repo-name">Task graph</h1><p>See dependencies. Find your next task.</p></div>
+      <div class="filter-block">
+        <label class="eyebrow" for="workstream-select">Workstream</label>
+        <select id="workstream-select" disabled><option value="">All tasks</option></select>
+        <p class="filter-help">Groups can overlap. A slash is part of a name, not a folder. Filters never change task status.</p>
+      </div>
+      <section class="legend-section" aria-labelledby="legend-title">
+        <h2 id="legend-title" class="eyebrow">Status in this view</h2>
+        <ul id="status-legend" class="status-legend"></ul>
+        <p class="filter-help">Complete means completed. Closed means not planned or duplicate; it does not unblock other tasks.</p>
+      </section>
+      <div class="sidebar-footer"><span class="dependency-key" aria-hidden="true">○ ───→ ○</span><p>Arrows go from blocker to dependent. Only tasks in this view are connected.</p><p>All tasks includes completed and closed work.</p></div>
+    </aside>
+    <section class="main-panel" aria-label="Task dashboard">
+      <div class="view-header"><div><span class="eyebrow">Dependency graph</span><h2 id="view-title">All tasks</h2><p id="view-summary">Loading your task graph…</p></div><div class="refresh-controls"><label class="auto-refresh"><input id="auto-refresh" type="checkbox">Refresh every 60s</label><button id="refresh-button" class="button secondary" type="button">Refresh</button><span id="refresh-status" role="status">Connecting…</span></div></div>
+      <div id="error-banner" class="banner error-banner" role="alert" hidden></div>
+      <div id="tmux-warning" class="banner warning-banner" role="status" hidden></div>
+      <div class="graph-toolbar"><div class="search-box"><span aria-hidden="true">⌕</span><input id="task-search" type="search" placeholder="Search title, #number, branch…" aria-label="Search tasks" autocomplete="off"></div><div class="zoom-controls" role="group" aria-label="Graph zoom"><button id="zoom-out" class="icon-button" type="button" aria-label="Zoom out">−</button><output id="zoom-level" aria-label="Zoom level">100%</output><button id="zoom-in" class="icon-button" type="button" aria-label="Zoom in">+</button><span class="control-divider"></span><button id="fit-graph" class="button compact" type="button">Fit graph</button></div></div>
+      <div id="workspace" class="workspace">
+        <div id="graph-viewport" class="graph-viewport" tabindex="0" role="region" aria-label="Task dependency graph" aria-describedby="graph-help">
+          <div id="graph-stage" class="graph-stage"><svg id="graph-edges" class="graph-edges" aria-hidden="true"></svg><div id="graph-nodes"></div></div>
+          <div id="graph-state" class="graph-state" role="status"><span class="state-symbol loading-symbol" aria-hidden="true">○</span><h3>Loading your task graph</h3><p>Reading tasks and local worktrees. This may take a moment.</p></div>
+        </div>
+        <aside id="detail-panel" class="detail-panel" aria-label="Task details" hidden></aside>
+      </div>
+      <footer class="graph-footer"><p id="graph-help">Select a task for details · Drag the background to pan · Use + / − to zoom</p><span id="edge-count"></span></footer>
+    </section>
+  </main>
+  <noscript><p class="noscript-message">JavaScript is required to load the local task graph. Enable it and reload this page.</p></noscript>
+</body>
+</html>

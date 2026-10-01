@@ -4,10 +4,24 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use github_orchestrator::Result;
 use github_orchestrator::config::Config;
-use github_orchestrator::process::{System, which};
+use github_orchestrator::process::{Cmd, Runner, System, which};
 use github_orchestrator::workspace::{Workspace, github_remote_repo};
 use tempfile::TempDir;
+
+/// Do not inherit the developer's worktree layout or user hooks in disposable-repository tests.
+struct TestSystem;
+
+impl Runner for TestSystem {
+    fn run(&self, cmd: &Cmd) -> Result<String> {
+        let mut cmd = cmd.clone();
+        if cmd.argv.first().is_some_and(|program| program == "wt") {
+            cmd.argv.splice(1..1, ["--config".into(), "/dev/null".into()]);
+        }
+        System.run(&cmd)
+    }
+}
 
 fn git(path: &Path, args: &[&str]) -> String {
     let output = Command::new("git").arg("-C").arg(path).args(args).output().unwrap();
@@ -97,7 +111,7 @@ fn remote_rejects_credentials_and_other_hosts() {
 #[test]
 fn verify_checkout_requires_matching_github_origin() {
     let repo = repository();
-    let workspace = Workspace::new(&repo.config, &System);
+    let workspace = Workspace::new(&repo.config, &TestSystem);
     let error = workspace.verify_checkout().unwrap_err();
     assert!(error.to_string().contains("origin"), "{error}");
     git(&repo.config.checkout, &["remote", "set-url", "origin", "git@github.com:Example/Mono.git"]);
@@ -112,7 +126,7 @@ fn worktree_starts_from_latest_fetched_base() {
     let repo = repository();
     let latest = commit(&repo.seed, "new.txt", "landed on main after the clone");
     git(&repo.seed, &["push", "-q", "origin", "HEAD:main"]);
-    let workspace = Workspace::new(&repo.config, &System);
+    let workspace = Workspace::new(&repo.config, &TestSystem);
     let created = workspace.create(42, None).unwrap();
     assert_eq!(created.branch, "rowantran/gh-42");
     assert_eq!((created.base.as_str(), created.base_commit.as_str()), ("origin/main", latest.as_str()));
@@ -130,7 +144,7 @@ fn worktree_can_stack_on_unmerged_branch() {
         return;
     }
     let repo = repository();
-    let workspace = Workspace::new(&repo.config, &System);
+    let workspace = Workspace::new(&repo.config, &TestSystem);
     let upstream = workspace.create(1, None).unwrap();
     let upstream_commit = commit(Path::new(&upstream.path), "feature.txt", "unmerged upstream work");
     let stacked = workspace.create(2, Some("rowantran/gh-1")).unwrap();
@@ -149,7 +163,7 @@ fn fetch_returns_the_latest_pushed_branch_to_stack_on() {
     git(&repo.seed, &["switch", "-q", "-c", "rowantran/gh-1"]);
     let pushed = commit(&repo.seed, "feature.txt", "blocker work under review");
     git(&repo.seed, &["push", "-q", "origin", "rowantran/gh-1"]);
-    let workspace = Workspace::new(&repo.config, &System);
+    let workspace = Workspace::new(&repo.config, &TestSystem);
     assert_eq!(workspace.fetch("rowantran/gh-1").unwrap(), "origin/rowantran/gh-1");
     assert_eq!(git(&repo.config.checkout, &["rev-parse", "origin/rowantran/gh-1"]), pushed);
     assert!(!workspace.branch_exists("rowantran/gh-1").unwrap());
@@ -166,7 +180,7 @@ fn existing_branch_is_reported_not_replaced() {
         return;
     }
     let repo = repository();
-    let workspace = Workspace::new(&repo.config, &System);
+    let workspace = Workspace::new(&repo.config, &TestSystem);
     let first = workspace.create(7, None).unwrap();
     let error = workspace.create(7, None).unwrap_err().to_string();
     assert!(error.contains(&format!("already exists at {}", first.path)), "{error}");
@@ -178,7 +192,7 @@ fn existing_branch_is_reported_not_replaced() {
 #[test]
 fn branch_exists_distinguishes_missing_from_failure() {
     let repo = repository();
-    let workspace = Workspace::new(&repo.config, &System);
+    let workspace = Workspace::new(&repo.config, &TestSystem);
     assert!(workspace.branch_exists("main").unwrap());
     assert!(!workspace.branch_exists("rowantran/gh-99").unwrap());
 }
@@ -186,6 +200,6 @@ fn branch_exists_distinguishes_missing_from_failure() {
 #[test]
 fn unknown_base_is_an_actionable_error() {
     let repo = repository();
-    let error = Workspace::new(&repo.config, &System).create(3, Some("nope")).unwrap_err().to_string();
+    let error = Workspace::new(&repo.config, &TestSystem).create(3, Some("nope")).unwrap_err().to_string();
     assert!(error.contains("Unknown base \"nope\""), "{error}");
 }

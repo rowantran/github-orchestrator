@@ -16,7 +16,8 @@ use serde_json::Value;
 
 use crate::domain::{Issue, IssueRef, IssueState, PullRequest, PullRequestState, StateReason, validate_repo};
 use crate::process::{Cmd, Runner};
-use crate::{Error, Result};
+use crate::workstreams;
+use crate::{Error, Result, ensure};
 
 static PROJECT_PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^/(users|orgs)/([A-Za-z0-9-]+)/projects/([1-9][0-9]*)(?:/views/[1-9][0-9]*)?/?$").unwrap()
@@ -28,6 +29,8 @@ static LOGIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-
 
 const PR_FIELDS: &str = "id number url state merged isDraft baseRefName headRefName \
     mergeCommit { oid } repository { nameWithOwner } headRepository { nameWithOwner }";
+const ISSUE_FIELDS: &str = "title body state stateReason issueDependenciesSummary { totalBlockedBy }";
+const BATCH_SIZE: usize = 50;
 
 fn metadata(detail: impl Display) -> Error {
     Error::msg(format!("Missing, inaccessible, or inconsistent GitHub metadata: {detail}"))
@@ -87,6 +90,26 @@ struct Assignee {
     id: String,
     #[serde(deserialize_with = "text")]
     login: String,
+}
+
+#[derive(Deserialize)]
+struct LabelNode {
+    #[serde(deserialize_with = "text")]
+    id: String,
+    #[serde(deserialize_with = "text")]
+    name: String,
+}
+
+impl Node for LabelNode {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Deserialize)]
+struct RestLabel {
+    #[serde(deserialize_with = "text")]
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -404,12 +427,38 @@ impl<'a> GitHub<'a> {
         }
         let mut data = self.graphql(&query, &variables)?;
         let issue = data.pointer_mut("/repository/issue").map(Value::take).unwrap_or_default();
-        check!(issue.is_object(), "{}", reference.url());
-        let identity = IssueIdentity::deserialize(&issue).map_err(|error| metadata(format!("issue: {error}")))?;
-        let actual = IssueRef::parse(&identity.url, None)?;
-        check!(actual == *reference && identity.number.get() == reference.number(), "issue identity");
-        check!(identity.repository.name_with_owner.to_lowercase() == reference.repo(), "issue repository");
+        check_issue_identity(reference, &issue)?;
         Ok(issue)
+    }
+
+    /// At most fifty repository issues per request. Numeric aliases are derived from validated
+    /// references, never user query text. Every alias and issue identity must be present and correct.
+    fn issue_batch(&self, references: &[IssueRef], fields: &str) -> Result<Vec<Value>> {
+        check!(references.len() <= BATCH_SIZE, "issue batch size");
+        let (owner, name) = self.repo.split_once('/').expect("validated OWNER/REPO");
+        let mut selections = String::new();
+        let mut seen = HashSet::new();
+        for reference in references {
+            check!(reference.repo().eq_ignore_ascii_case(&self.repo), "issue batch repository");
+            check!(seen.insert(reference), "duplicate issue batch reference");
+            selections.push_str(&format!(
+                "issue_{number}: issue(number: {number}) {{ id number url repository {{ nameWithOwner }} {fields} }} ",
+                number = reference.number()
+            ));
+        }
+        let query = format!(
+            "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {selections} }} }}"
+        );
+        let mut data = self.graphql(&query, &[("owner", Var::Str(owner)), ("name", Var::Str(name))])?;
+        references
+            .iter()
+            .map(|reference| {
+                let path = format!("/repository/issue_{}", reference.number());
+                let issue = data.pointer_mut(&path).map(Value::take).unwrap_or_default();
+                check_issue_identity(reference, &issue)?;
+                Ok(issue)
+            })
+            .collect()
     }
 
     fn issue_connection<T: Node + DeserializeOwned>(
@@ -419,12 +468,29 @@ impl<'a> GitHub<'a> {
         selection: &str,
         extra: &str,
     ) -> Result<Vec<T>> {
+        self.issue_connection_from(reference, field, selection, extra, None)
+    }
+
+    /// Continue a connection whose first page may have arrived in a batch. The normal pagination
+    /// validator checks that first page too, including truncated counts and non-advancing cursors.
+    fn issue_connection_from<T: Node + DeserializeOwned>(
+        &self,
+        reference: &IssueRef,
+        field: &str,
+        selection: &str,
+        extra: &str,
+        mut first: Option<Value>,
+    ) -> Result<Vec<T>> {
         let fields = format!(
             "{field}(first: 100, after: $cursor{extra}) {{ totalCount pageInfo {{ hasNextPage endCursor }} nodes {{ {selection} }} }}"
         );
         paginate(|cursor| {
-            let mut issue = self.issue_data(reference, &fields, cursor)?;
-            let connection = issue.get_mut(field).map(Value::take).unwrap_or_default();
+            let connection = if let Some(first) = first.take() {
+                first
+            } else {
+                let mut issue = self.issue_data(reference, &fields, cursor)?;
+                issue.get_mut(field).map(Value::take).unwrap_or_default()
+            };
             parse(connection, field)
         })
     }
@@ -465,19 +531,238 @@ impl<'a> GitHub<'a> {
         Ok(result)
     }
 
-    /// Any issue on github.com. Deliberately not restricted to this queue: blockers can be anywhere.
-    pub fn issue(&self, reference: &IssueRef) -> Result<Issue> {
-        let fields = "title body state stateReason issueDependenciesSummary { totalBlockedBy }";
-        let data: IssueFields = parse(self.issue_data(reference, fields, None)?, "issue")?;
-        check!(data.state != IssueState::Closed || data.state_reason.is_some(), "closed issue stateReason");
-        let assignees: Vec<Assignee> = self.issue_connection(reference, "assignees", "id login", "")?;
+    /// All repository issues in the configured Project, regardless of assignee or state. Membership
+    /// reads use `includeArchived: true`, in batches of fifty rather than one request per historical
+    /// issue. Only Project members are hydrated, also in batches.
+    pub fn project_issues(&self) -> Result<Vec<Issue>> {
+        let project_id = self.project()?.id.clone();
+        let endpoint = format!("repos/{}/issues?state=all&per_page=100", self.repo);
+        let mut seen = HashSet::new();
+        let mut references = Vec::new();
+        for candidate in self.rest_pages(&endpoint)? {
+            if candidate.get("pull_request").is_some() {
+                continue;
+            }
+            let candidate: QueueCandidate = parse(candidate, "project issue")?;
+            let reference = issue_ref(&candidate.html_url, candidate.number)?;
+            check!(reference.repo().eq_ignore_ascii_case(&self.repo), "project issue repository");
+            check!(seen.insert(reference.clone()), "duplicate issue in paginated project issues");
+            check!(
+                candidate.state.eq_ignore_ascii_case("open") || candidate.state.eq_ignore_ascii_case("closed"),
+                "issue state"
+            );
+            references.push(reference);
+        }
+        let membership = "projectItems(first: 100, includeArchived: true) { \
+            totalCount pageInfo { hasNextPage endCursor } nodes { id project { id } } }";
+        let mut members = Vec::new();
+        for chunk in references.chunks(BATCH_SIZE) {
+            for (reference, mut value) in chunk.iter().zip(self.issue_batch(chunk, membership)?) {
+                let first = value.get_mut("projectItems").map(Value::take).unwrap_or_default();
+                let items = self.issue_connection_from(
+                    reference,
+                    "projectItems",
+                    "id project { id }",
+                    ", includeArchived: true",
+                    Some(first),
+                )?;
+                let project_ids = project_ids(items, &project_id)?;
+                if project_ids.contains(&project_id) {
+                    members.push((reference.clone(), project_ids));
+                }
+            }
+        }
+        // Hydrate only Project members. Assignees and linked PRs share the issue-fields request;
+        // rare connections over one page continue through the existing strict cursor reader.
+        let fields = format!(
+            "{ISSUE_FIELDS} \
+             assignees(first: 100) {{ totalCount pageInfo {{ hasNextPage endCursor }} nodes {{ id login }} }} \
+             closedByPullRequestsReferences(first: 100, includeClosedPrs: true) {{ \
+             totalCount pageInfo {{ hasNextPage endCursor }} nodes {{ {PR_FIELDS} }} }}"
+        );
+        let mut result = Vec::new();
+        for chunk in members.chunks(BATCH_SIZE) {
+            let references: Vec<_> = chunk.iter().map(|(reference, _)| reference.clone()).collect();
+            for ((reference, project_ids), value) in chunk.iter().zip(self.issue_batch(&references, &fields)?) {
+                result.push(self.read_issue(reference, Some(project_ids.clone()), Some(value))?);
+            }
+        }
+        result.sort_by(|a, b| a.reference.cmp(&b.reference));
+        Ok(result)
+    }
+
+    /// All labels currently attached to an issue. Paginated and identity-checked like other issue
+    /// connections, so a pull request number or inaccessible issue is never silently accepted.
+    pub fn issue_labels(&self, reference: &IssueRef) -> Result<Vec<String>> {
+        let labels: Vec<LabelNode> = self.issue_connection(reference, "labels", "id name", "")?;
+        label_names(labels.into_iter().map(|label| label.name))
+    }
+
+    /// Snapshot labels, in input order. Each first page shares a request with up to 49 other issues.
+    pub(crate) fn issue_labels_batch(&self, references: &[IssueRef]) -> Result<Vec<Vec<String>>> {
+        let fields = "labels(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { id name } }";
+        let mut result = Vec::new();
+        for chunk in references.chunks(BATCH_SIZE) {
+            for (reference, mut value) in chunk.iter().zip(self.issue_batch(chunk, fields)?) {
+                let first = value.get_mut("labels").map(Value::take).unwrap_or_default();
+                let labels: Vec<LabelNode> =
+                    self.issue_connection_from(reference, "labels", "id name", "", Some(first))?;
+                result.push(label_names(labels.into_iter().map(|label| label.name))?);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Defined workstreams, including labels not currently attached to any issue.
+    pub fn workstreams(&self) -> Result<Vec<String>> {
+        let endpoint = format!("repos/{}/labels?per_page=100", self.repo);
+        let labels = self.rest_pages(&endpoint)?.into_iter().map(|value| parse::<RestLabel>(value, "label"));
+        let names = label_names(labels.collect::<Result<Vec<_>>>()?.into_iter().map(|label| label.name))?;
+        workstreams::names(&names)
+    }
+
+    /// Define a workstream without changing an existing label's description or color.
+    pub fn create_workstream(&self, name: &str) -> Result<()> {
+        let label = workstreams::label(name)?;
+        if self.workstreams()?.iter().any(|existing| existing.eq_ignore_ascii_case(name)) {
+            return Ok(());
+        }
+        let endpoint = format!("repos/{}/labels", self.repo);
+        let created = self.api(&endpoint, &["--method", "POST", "-f", &format!("name={label}"), "-f", "color=5319e7"]);
+        let value = match created {
+            Ok(value) => value,
+            Err(error) => {
+                // Another client may have created the label after our read. Only recover GitHub's
+                // conflict response, not authentication, transport or malformed-response failures.
+                if matches!(&error, Error::Command { stderr, .. } if stderr.contains("HTTP 422"))
+                    && self.workstreams()?.iter().any(|existing| existing.eq_ignore_ascii_case(name))
+                {
+                    return Ok(());
+                }
+                return Err(Error::msg(format!(
+                    "Could not create workstream {name:?}: {error}. Check the repository labels before retrying."
+                )));
+            }
+        };
+        let verify = || -> Result<()> {
+            let created: RestLabel = parse(value, "created workstream label")?;
+            check!(created.name.eq_ignore_ascii_case(&label), "created workstream label name");
+            Ok(())
+        };
+        verify().map_err(|error| {
+            Error::msg(format!(
+                "Workstream {name:?} may have been created, but the response could not be verified: {error}. \
+             Check the repository labels before retrying."
+            ))
+        })
+    }
+
+    pub fn add_to_workstream(&self, name: &str, issues: &[IssueRef]) -> Result<()> {
+        self.change_workstream(name, issues, true)
+    }
+
+    pub fn remove_from_workstream(&self, name: &str, issues: &[IssueRef]) -> Result<()> {
+        self.change_workstream(name, issues, false)
+    }
+
+    fn change_workstream(&self, name: &str, issues: &[IssueRef], add: bool) -> Result<()> {
+        let label = workstreams::label(name)?;
+        // Validate the entire request before writing anything.
+        for reference in issues {
+            ensure!(
+                reference.repo().eq_ignore_ascii_case(&self.repo),
+                "Workstream {name:?} belongs to {}; cannot change {}.",
+                self.repo,
+                reference.url()
+            );
+        }
+        ensure!(
+            self.workstreams()?.iter().any(|existing| existing.eq_ignore_ascii_case(name)),
+            "Unknown workstream {name:?}. Create it before changing membership."
+        );
+        let mut completed = Vec::new();
+        let mut seen = HashSet::new();
+        for reference in issues {
+            if !seen.insert(reference) {
+                continue;
+            }
+            let update = || -> Result<()> {
+                let labels = self.issue_labels(reference)?;
+                if labels.iter().any(|existing| existing.eq_ignore_ascii_case(&label)) == add {
+                    return Ok(());
+                }
+                let endpoint = format!("repos/{}/issues/{}/labels", self.repo, reference.number());
+                let response = if add {
+                    // POST appends; PUT would replace unrelated labels and other memberships.
+                    self.api(&endpoint, &["--method", "POST", "-f", &format!("labels[]={label}")])?
+                } else {
+                    // Encode the complete label: slashes in names are data, not URL path separators.
+                    let encoded: String = label.bytes().map(|byte| format!("%{byte:02X}")).collect();
+                    self.api(&format!("{endpoint}/{encoded}"), &["--method", "DELETE"])?
+                };
+                let labels: Vec<RestLabel> = parse(response, "updated issue labels")?;
+                let labels = label_names(labels.into_iter().map(|label| label.name))?;
+                check!(
+                    labels.iter().any(|existing| existing.eq_ignore_ascii_case(&label)) == add,
+                    "workstream membership after update"
+                );
+                Ok(())
+            };
+            if let Err(error) = update() {
+                let action = if add { "add to" } else { "remove from" };
+                let previous = if completed.is_empty() { "none".into() } else { completed.join(", ") };
+                return Err(Error::msg(format!(
+                    "Could not {action} workstream {name:?} for {}: {error}. \
+                     Earlier successful issues: {previous}. The failing issue may have changed; \
+                     remaining issues were not attempted. Check membership before retrying.",
+                    reference.url()
+                )));
+            }
+            completed.push(reference.url());
+        }
+        Ok(())
+    }
+
+    fn issue_project_ids(&self, reference: &IssueRef) -> Result<Vec<String>> {
         let items: Vec<ProjectItem> =
             self.issue_connection(reference, "projectItems", "id project { id }", ", includeArchived: true")?;
-        let project_ids: Vec<String> = items.into_iter().map(|item| item.project.id).collect();
-        let project_id = &self.project()?.id;
-        check!(project_ids.iter().filter(|id| *id == project_id).count() <= 1, "duplicate project membership");
-        let closing: Vec<PullRequestNode> =
-            self.issue_connection(reference, "closedByPullRequestsReferences", PR_FIELDS, ", includeClosedPrs: true")?;
+        project_ids(items, &self.project()?.id)
+    }
+
+    /// Any issue on github.com. Deliberately not restricted to this queue: blockers can be anywhere.
+    pub fn issue(&self, reference: &IssueRef) -> Result<Issue> {
+        self.read_issue(reference, None, None)
+    }
+
+    fn read_issue(
+        &self,
+        reference: &IssueRef,
+        project_ids: Option<Vec<String>>,
+        initial: Option<Value>,
+    ) -> Result<Issue> {
+        let batched = initial.is_some();
+        let mut value = match initial {
+            Some(value) => value,
+            None => self.issue_data(reference, ISSUE_FIELDS, None)?,
+        };
+        let first_assignees = batched.then(|| value.get_mut("assignees").map(Value::take).unwrap_or_default());
+        let first_closing =
+            batched.then(|| value.get_mut("closedByPullRequestsReferences").map(Value::take).unwrap_or_default());
+        let data: IssueFields = parse(value, "issue")?;
+        check!(data.state != IssueState::Closed || data.state_reason.is_some(), "closed issue stateReason");
+        let assignees: Vec<Assignee> =
+            self.issue_connection_from(reference, "assignees", "id login", "", first_assignees)?;
+        let project_ids = match project_ids {
+            Some(ids) => ids,
+            None => self.issue_project_ids(reference)?,
+        };
+        let closing: Vec<PullRequestNode> = self.issue_connection_from(
+            reference,
+            "closedByPullRequestsReferences",
+            PR_FIELDS,
+            ", includeClosedPrs: true",
+            first_closing,
+        )?;
         let endpoint =
             format!("repos/{}/issues/{}/dependencies/blocked_by?per_page=100", reference.repo(), reference.number());
         let blockers = self
@@ -508,14 +793,78 @@ impl<'a> GitHub<'a> {
     /// Found by head branch, not by closing keywords: GitHub ignores "Closes #N" on pull requests
     /// that target a branch other than the default branch, so stacked pull requests are never linked.
     pub fn open_pull_request(&self, branch: &str) -> Result<Option<PullRequest>> {
+        let mut found = self.branch_pull_requests(branch, true)?;
+        if found.len() > 1 {
+            let urls: Vec<&str> = found.iter().map(|pr| pr.url.as_str()).collect();
+            return Err(Error::msg(format!(
+                "More than one open pull request from {branch}: {}. Close the extras.",
+                urls.join(", ")
+            )));
+        }
+        Ok(found.pop())
+    }
+
+    /// All pull requests from a local-repository branch, including completed stacked pull requests
+    /// that GitHub never linked through closing keywords.
+    pub fn pull_requests(&self, branch: &str) -> Result<Vec<PullRequest>> {
+        self.branch_pull_requests(branch, false)
+    }
+
+    /// Snapshot branch matches, in input order. This includes merged stacked pull requests. Branch
+    /// names stay GraphQL variables, and each connection retains independent pagination checks.
+    pub(crate) fn pull_requests_batch(&self, branches: &[String]) -> Result<Vec<Vec<PullRequest>>> {
         let (owner, name) = self.repo.split_once('/').expect("validated OWNER/REPO");
+        let mut result = Vec::new();
+        for chunk in branches.chunks(BATCH_SIZE) {
+            let keys: Vec<_> = (0..chunk.len()).map(|index| format!("branch_{index}")).collect();
+            let declarations: String = keys.iter().map(|key| format!(", ${key}: String!")).collect();
+            let fields: String = keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    format!(
+                        "pr_{index}: pullRequests(headRefName: ${key}, states: [OPEN, CLOSED, MERGED], first: 100) {{ \
+                 totalCount pageInfo {{ hasNextPage endCursor }} nodes {{ {PR_FIELDS} }} }} "
+                    )
+                })
+                .collect();
+            let query = format!(
+                "query($owner: String!, $name: String!{declarations}) {{ \
+                 repository(owner: $owner, name: $name) {{ {fields} }} }}"
+            );
+            let mut variables = vec![("owner", Var::Str(owner)), ("name", Var::Str(name))];
+            variables.extend(keys.iter().zip(chunk).map(|(key, branch)| (key.as_str(), Var::Str(branch))));
+            let mut data = self.graphql(&query, &variables)?;
+            for (index, branch) in chunk.iter().enumerate() {
+                let first = data.pointer_mut(&format!("/repository/pr_{index}")).map(Value::take).unwrap_or_default();
+                result.push(self.branch_pull_requests_from(branch, false, Some(first))?);
+            }
+        }
+        Ok(result)
+    }
+
+    fn branch_pull_requests(&self, branch: &str, open_only: bool) -> Result<Vec<PullRequest>> {
+        self.branch_pull_requests_from(branch, open_only, None)
+    }
+
+    fn branch_pull_requests_from(
+        &self,
+        branch: &str,
+        open_only: bool,
+        mut first: Option<Value>,
+    ) -> Result<Vec<PullRequest>> {
+        let (owner, name) = self.repo.split_once('/').expect("validated OWNER/REPO");
+        let states = if open_only { "OPEN" } else { "OPEN, CLOSED, MERGED" };
         let query = format!(
             "query($owner: String!, $name: String!, $branch: String!, $cursor: String) {{ \
              repository(owner: $owner, name: $name) {{ \
-             pullRequests(headRefName: $branch, states: [OPEN], first: 100, after: $cursor) {{ \
+             pullRequests(headRefName: $branch, states: [{states}], first: 100, after: $cursor) {{ \
              totalCount pageInfo {{ hasNextPage endCursor }} nodes {{ {PR_FIELDS} }} }} }} }}"
         );
         let nodes: Vec<PullRequestNode> = paginate(|cursor| {
+            if let Some(first) = first.take() {
+                return parse(first, "pull requests (check repository access)");
+            }
             let mut variables =
                 vec![("owner", Var::Str(owner)), ("name", Var::Str(name)), ("branch", Var::Str(branch))];
             if let Some(cursor) = cursor {
@@ -531,20 +880,17 @@ impl<'a> GitHub<'a> {
             // A fork's branch with the same name is someone else's work.
             let head = node.head_repository.as_ref().map(|r| r.name_with_owner.to_lowercase());
             let pr = pull_request(node)?;
-            check!(pr.state == PullRequestState::Open && pr.head == branch, "pull request for {branch}");
+            check!(
+                (!open_only || pr.state == PullRequestState::Open) && pr.head == branch,
+                "pull request for {branch}"
+            );
             check!(pr.repo.to_lowercase() == repo, "pull request repository");
             if head.as_deref() == Some(repo.as_str()) {
                 found.push(pr);
             }
         }
-        if found.len() > 1 {
-            let urls: Vec<&str> = found.iter().map(|pr| pr.url.as_str()).collect();
-            return Err(Error::msg(format!(
-                "More than one open pull request from {branch}: {}. Close the extras.",
-                urls.join(", ")
-            )));
-        }
-        Ok(found.pop())
+        found.sort_by_key(|pr| pr.number);
+        Ok(found)
     }
 
     /// Create an issue assigned to the owner and blocked by `blockers`, then add it to the Project.
@@ -599,6 +945,32 @@ impl<'a> GitHub<'a> {
             ))
         })
     }
+}
+
+fn check_issue_identity(reference: &IssueRef, issue: &Value) -> Result<()> {
+    check!(issue.is_object(), "{}", reference.url());
+    let identity = IssueIdentity::deserialize(issue).map_err(|error| metadata(format!("issue: {error}")))?;
+    let actual = IssueRef::parse(&identity.url, None)?;
+    check!(actual == *reference && identity.number.get() == reference.number(), "issue identity");
+    check!(identity.repository.name_with_owner.to_lowercase() == reference.repo(), "issue repository");
+    Ok(())
+}
+
+fn project_ids(items: Vec<ProjectItem>, project_id: &str) -> Result<Vec<String>> {
+    let ids: Vec<String> = items.into_iter().map(|item| item.project.id).collect();
+    check!(ids.iter().filter(|id| *id == project_id).count() <= 1, "duplicate project membership");
+    Ok(ids)
+}
+
+fn label_names(names: impl Iterator<Item = String>) -> Result<Vec<String>> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for name in names {
+        check!(seen.insert(name.to_lowercase()), "duplicate label name");
+        result.push(name);
+    }
+    result.sort();
+    Ok(result)
 }
 
 fn pull_request(node: PullRequestNode) -> Result<PullRequest> {

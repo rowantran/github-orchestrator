@@ -258,6 +258,42 @@ fn parser_rejects_incomplete_or_removed_commands() {
     assert!(cli.is_ok());
 }
 
+#[test]
+fn workstreams_and_dashboard_have_explicit_safe_cli_arguments() {
+    use github_orchestrator::cli::{Command as GhoCommand, TaskCommand, WorkstreamCommand};
+    let parsed = Cli::try_parse_from([
+        "gho",
+        "task",
+        "create",
+        "--title",
+        "Task",
+        "--body-file",
+        "task.md",
+        "--workstream",
+        "project-a",
+        "--workstream",
+        "project-a/feature-1",
+    ])
+    .unwrap();
+    assert!(matches!(parsed.command, GhoCommand::Task(TaskCommand::Create { workstream, .. })
+        if workstream == ["project-a", "project-a/feature-1"]));
+    let parsed = Cli::try_parse_from(["gho", "workstream", "add", "project-a", "1", "2"]).unwrap();
+    assert!(matches!(parsed.command, GhoCommand::Workstream(WorkstreamCommand::Add { name, issues })
+        if name == "project-a" && issues == ["1", "2"]));
+    let parsed = Cli::try_parse_from(["gho", "dashboard", "--port", "8080", "--tmux-session", "agents"]).unwrap();
+    assert!(
+        matches!(parsed.command, GhoCommand::Dashboard { port: 8080, tmux_session: Some(session) } if session == "agents")
+    );
+    for args in [
+        vec!["gho", "dashboard", "--port", "65536"],
+        vec!["gho", "dashboard", "--host", "0.0.0.0"],
+        vec!["gho", "workstream", "add", "project-a"],
+        vec!["gho", "workstream", "remove", "project-a"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+}
+
 fn entry(number: u64, title: &str, state: State, worktree: Option<&str>, blockers: Vec<Blocker>) -> Entry {
     Entry {
         number,

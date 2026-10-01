@@ -117,8 +117,8 @@ pub struct Blocker {
     pub state: State,
     pub branch: Option<String>,
     pub worktree: Option<String>,
-    /// Pull requests that close this issue. Stacked pull requests are not listed: GitHub only links
-    /// closing keywords on pull requests into the default branch.
+    /// Pull requests that close this issue. The dashboard also adds branch matches, because GitHub
+    /// only links closing keywords on pull requests into the default branch.
     pub pull_requests: Vec<LinkedPullRequest>,
 }
 
@@ -145,11 +145,20 @@ impl From<&PullRequest> for LinkedPullRequest {
 
 /// Classify every open queue issue.
 pub fn survey(config: &Config, github: &dyn Issues, workspace: &dyn Branches) -> Result<Vec<Entry>> {
-    let queue = github.queue()?;
+    survey_issues(config, github, workspace, github.queue()?)
+}
+
+/// Classify a complete issue set before a caller applies display filters. Dependencies outside the
+/// set are still resolved through `github`, and shared dependencies are read only once.
+pub fn survey_issues(
+    config: &Config,
+    github: &dyn Issues,
+    workspace: &dyn Branches,
+    issues: Vec<Issue>,
+) -> Result<Vec<Entry>> {
     let mut classifier = Classifier::new(config, github, workspace)?;
-    // Blockers are often queue issues too; do not fetch them twice.
-    classifier.issues.extend(queue.iter().map(|issue| (issue.reference.clone(), issue.clone())));
-    queue.into_iter().map(|issue| classifier.entry(issue)).collect()
+    classifier.issues.extend(issues.iter().map(|issue| (issue.reference.clone(), issue.clone())));
+    issues.into_iter().map(|issue| classifier.entry(issue)).collect()
 }
 
 /// Classify one issue, for example before creating its worktree.

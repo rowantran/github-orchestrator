@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use github_orchestrator::Result;
 use github_orchestrator::config::Config;
 use github_orchestrator::domain::{Issue, IssueRef, IssueState, PullRequest, PullRequestState, StateReason};
-use github_orchestrator::work::{Branches, Issues, LinkedPullRequest, State, classify, survey};
+use github_orchestrator::work::{Branches, Issues, LinkedPullRequest, State, classify, survey, survey_issues};
 
 const REPO: &str = "acme/app";
 
@@ -350,4 +350,15 @@ fn classify_reports_one_issue_including_closed_ones() {
     let workspace = FakeWorkspace::default();
     assert_eq!(classify(&config(), &github, &workspace, &reference(REPO, 2)).unwrap().state, stacked(&[1]));
     assert_eq!(classify(&config(), &github, &workspace, &reference(REPO, 3)).unwrap().state, State::Done);
+}
+
+#[test]
+fn explicit_survey_uses_full_set_instead_of_the_personal_queue() {
+    let all = vec![issue(1, &[]), issue(2, &blocked_by(&[1])), closed(3, StateReason::Completed)];
+    let github = FakeGitHub::new(vec![], all.clone()).with_reviews(&[open_pr(10, "owner/gh-1", "main")]);
+    let entries = survey_issues(&config(), &github, &FakeWorkspace::default(), all).unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[1].state, stacked(&[1]));
+    assert_eq!(entries[2].state, State::Done);
+    assert!(github.issue_calls.borrow().is_empty());
 }

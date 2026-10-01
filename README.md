@@ -1,12 +1,14 @@
 # GitHub Orchestrator
 
-`gho` is a small CLI that an orchestrator agent uses to work through your GitHub issue queue. It does three things:
+`gho` is a small CLI that an orchestrator agent uses to work through your GitHub issue queue. Its core operations are:
 
 1. **Register work:** create GitHub issues assigned to you, added to your Project, with native "blocked by" links.
 2. **Find ready work:** list open issues in your queue that you can start: every blocker is done, or has an open pull request to stack on.
 3. **Create a worktree:** make branch `<owner>/gh-N` for a ready issue in a new Worktrunk worktree, from the latest base branch or stacked on its blockers' pull requests. The worktree gets a task brief for the issue's agents in `.gho/brief.md`, which Git ignores.
 
-The agent you talk to does everything else. It launches an implementer agent in each worktree, in its own tmux window. The implementer first commits a skeleton (pseudocode and stubs at the real paths) and opens a draft PR with it. You review the skeleton in PR comments, and the implementer answers there, with every comment prefixed `[agent:]`. When you approve, it implements the change, pushes it to the same PR, and marks the PR ready for review. Then the orchestrator launches a reviewer agent on it. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells the orchestrator how; `implementer.md` and `reviewer.md` next to it are the other agents' standing instructions. This repository is a Pi package that ships them.
+You can also group tasks into overlapping workstreams and view their dependencies in a local dashboard. The dashboard opens PR links and selects existing agent panes in tmux; it does not launch or manage agents.
+
+The agent you talk to handles the implementation workflow. It launches an implementer agent in each worktree, in its own tmux window. The implementer first commits a skeleton (pseudocode and stubs at the real paths) and opens a draft PR with it. You review the skeleton in PR comments, and the implementer answers there, with every comment prefixed `[agent:]`. When you approve, it implements the change, pushes it to the same PR, and marks the PR ready for review. Then the orchestrator launches a reviewer agent on it. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells the orchestrator how; `implementer.md` and `reviewer.md` next to it are the other agents' standing instructions. This repository is a Pi package that ships them.
 
 GitHub is the only task store. `gho` keeps no local state: a task is "in progress" when its branch exists or it has a draft pull request, and "ready for review" when an open pull request that is not a draft comes from that branch.
 
@@ -83,6 +85,46 @@ Only `ready` issues can be picked up. A ready issue's `stack_on` lists its block
 
 **Task brief.** `gho worktree N` fills in the template [`agent-context/brief.md`](agent-context/brief.md) and writes it to `.gho/brief.md` in the new worktree. The brief gives the issue, the branch, and the base branch that the pull request targets. The base branch is the branch that the worktree started from, or the configured base branch when `--base` is a commit or tag. `.gho/` contains its own `.gitignore`, so the brief is never committed. The orchestrator gives the brief to the implementer and reviewer agents as their first message.
 
+## Workstreams and the graph dashboard
+
+A **workstream** is a named subset of the tasks in your repository. Use one for a subproject, feature, or cross-cutting effort. Tasks can belong to several workstreams, and their blockers do not need to belong to the same workstream.
+
+```sh
+gho workstream create project-a
+gho workstream create project-a/feature-1
+gho workstream create shared-platform
+gho workstream add project-a 41 42 43
+gho workstream add project-a/feature-1 42 43
+gho workstream add shared-platform 42 50
+gho workstream remove project-a/feature-1 43
+gho workstream list --json
+
+# Assign memberships while creating a task (create the workstreams first):
+gho task create --title "One bounded change" --body-file task.md \
+  --workstream project-a --workstream project-a/feature-1
+
+# Run from a configured repository checkout, then open the printed URL:
+gho dashboard
+# Optional: choose a port and restrict focus to an exact tmux session name:
+gho dashboard --port 8080 --tmux-session agents
+```
+
+Memberships are GitHub labels named `gho:workstream:NAME`. They survive across machines and can also be edited on GitHub. Adding or removing a membership preserves all other labels. Names use letters, digits, `.`, `_`, `-`, and `/`, with each slash-separated segment starting with a letter or digit; the name is at most 35 characters. Names are case-insensitive on GitHub. A slash is just part of a name: `project-a/feature-1` does **not** automatically include a task in `project-a`. Add both memberships when you want both views. Empty workstreams remain selectable. Membership commands accept issue numbers or full issue URLs from this repository.
+
+The dashboard's **All tasks** view includes all issues in the configured repository and Project, regardless of assignee, including completed, closed, and archived Project items. This is broader than `gho ready`, which still shows only your open queue. Labels alone do not add an issue to the Project.
+
+- Select a workstream to see its dependency graph. Arrows point from a blocker to its dependent task.
+- Colors and text distinguish **Blocked**, **Ready**, **In progress**, **Ready for review**, **Complete**, and **Closed**. Closed means not planned or duplicate, not completed.
+- Filtering never recalculates readiness. A task blocked by something outside the visible graph stays blocked. Select it to inspect all blockers, including links outside this view.
+- Select a task to open its GitHub issue, draft/published/merged PRs, or focus an existing agent pane. Multiple matching panes appear in a selector.
+- Search tasks, pan the graph, zoom, or fit it to the viewport. Refresh manually or enable the optional 60-second refresh. A failed refresh reports an error instead of replacing the graph with an empty result.
+
+**tmux focus.** Run the dashboard on the machine and tmux server where the agents run. The orchestrator skill tags agent panes with `@gho_repo` and `@gho_issue`. Existing untagged panes also work when exactly one live pane has the task worktree root as its current directory. Ambiguous matches and panes in subdirectories need tags. Without `--tmux-session`, discovery uses the inherited tmux session when run inside tmux, otherwise the default server. Focus selects the verified window and pane; clients attached to that session see the selection. It does not open a terminal, attach a client, switch unrelated sessions, or send input. Missing tmux disables focus without hiding tasks.
+
+Each refresh reads GitHub metadata for the repository's issues and Project tasks in batches. Large repositories can take longer to load. A refresh has a 90-second subprocess budget; failures keep the last successful view and show an error. Automatic refresh is off by default to avoid unnecessary GitHub API use; it waits for the preceding request to finish and pauses in a hidden tab.
+
+**Local access.** The dashboard binds only to `127.0.0.1`, uses an available port by default, and stops with Ctrl-C. It serves bundled assets with no frontend build or external CDN. API calls require a per-process token; foreign hosts and origins are rejected. No GitHub credentials are sent to the browser and no task database is created. For a remote machine, use an SSH tunnel with the same local and remote port, then open `http://127.0.0.1:PORT/`. Do not expose the dashboard through a public proxy.
+
 ## Optional TaskNotes bridge
 
 Links Obsidian task notes to GitHub issues and marks the note done when all its issues are completed.
@@ -106,6 +148,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 (cd obsidian-plugin && npm ci && npm test && npm run build)
+(cd dashboard && npm test && npm run build)
+# Browser integration tests: see tests/dashboard_e2e/README.md
 ```
 
 Tests use temporary repositories, a local bare repository in place of GitHub, and a fake `gh`. They never write to real GitHub or a real vault. The Worktrunk tests run when `wt` is on `PATH`.

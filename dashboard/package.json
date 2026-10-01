@@ -1,0 +1,12 @@
+{
+  "name": "gho-local-dashboard",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "build": "node --check app.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
