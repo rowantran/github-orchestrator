@@ -62,9 +62,12 @@ pub enum Command {
     Workstream(WorkstreamCommand),
     /// Serve a local dependency graph of all tasks in this repository's Project
     Dashboard {
-        /// Loopback port; 0 chooses an available port
+        /// Listen port; 0 chooses a free local port, or tailnet port 8080 with --tailscale-serve
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// Share over HTTP using a temporary Tailscale Serve session (tailnet only)
+        #[arg(long)]
+        tailscale_serve: bool,
         /// Restrict pane discovery and focus to this exact tmux session name
         #[arg(long)]
         tmux_session: Option<String>,
@@ -187,8 +190,8 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
             })?;
             print_json(out, &Started { created, brief })
         }
-        Command::Dashboard { port, tmux_session } => {
-            dashboard::serve(&config, runner, port, tmux_session.as_deref(), out)
+        Command::Dashboard { port, tailscale_serve, tmux_session } => {
+            dashboard::serve(&config, runner, port, tailscale_serve, tmux_session.as_deref(), out)
         }
         Command::Workstream(command) => run_workstream(command, &config, &github, out),
         Command::Task(TaskCommand::Create { title, body_file, blocked_by, workstream, note }) => {

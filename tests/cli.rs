@@ -282,7 +282,8 @@ fn workstreams_and_dashboard_have_explicit_safe_cli_arguments() {
         if name == "project-a" && issues == ["1", "2"]));
     let parsed = Cli::try_parse_from(["gho", "dashboard", "--port", "8080", "--tmux-session", "agents"]).unwrap();
     assert!(
-        matches!(parsed.command, GhoCommand::Dashboard { port: 8080, tmux_session: Some(session) } if session == "agents")
+        matches!(parsed.command, GhoCommand::Dashboard { port: 8080, tmux_session: Some(session), tailscale_serve: false }
+            if session == "agents")
     );
     for args in [
         vec!["gho", "dashboard", "--port", "65536"],
@@ -292,6 +293,56 @@ fn workstreams_and_dashboard_have_explicit_safe_cli_arguments() {
     ] {
         assert!(Cli::try_parse_from(args).is_err());
     }
+}
+
+#[test]
+fn dashboard_tailscale_serve_is_opt_in_and_preserves_port_and_tmux_arguments() {
+    use github_orchestrator::cli::Command as GhoCommand;
+
+    for (args, expected_port, expected_tailscale) in [
+        (vec!["gho", "dashboard"], 0, false),
+        (vec!["gho", "dashboard", "--tailscale-serve"], 0, true),
+        (vec!["gho", "dashboard", "--tailscale-serve", "--port", "0"], 0, true),
+        (vec!["gho", "dashboard", "--tailscale-serve", "--port", "8080"], 8080, true),
+        (vec!["gho", "dashboard", "--port", "9080", "--tailscale-serve"], 9080, true),
+        (vec!["gho", "dashboard", "--tailscale-serve", "--port", "65535"], 65535, true),
+    ] {
+        let parsed = Cli::try_parse_from(args.clone()).unwrap();
+        assert!(
+            matches!(parsed.command, GhoCommand::Dashboard { port, tmux_session: None, tailscale_serve }
+                if port == expected_port && tailscale_serve == expected_tailscale),
+            "{args:?}"
+        );
+    }
+    let parsed =
+        Cli::try_parse_from(["gho", "dashboard", "--tailscale-serve", "--port", "9080", "--tmux-session", "agents"])
+            .unwrap();
+    assert!(matches!(parsed.command,
+        GhoCommand::Dashboard { port: 9080, tmux_session: Some(session), tailscale_serve: true }
+        if session == "agents"));
+
+    for args in [
+        vec!["gho", "dashboard", "--tailscale-serve", "--port", "65536"],
+        vec!["gho", "dashboard", "--tailscale-serve", "--port", "-1"],
+        vec!["gho", "dashboard", "--tailscale-serve", "--host", "0.0.0.0"],
+        vec!["gho", "dashboard", "--tailscale-serve=true"],
+        vec!["gho", "dashboard", "--tailscale-serve=false"],
+        vec!["gho", "ready", "--tailscale-serve"],
+    ] {
+        let error = Cli::try_parse_from(args.clone()).unwrap_err();
+        assert_eq!(error.exit_code(), 2, "{args:?}");
+    }
+}
+
+#[test]
+fn dashboard_help_documents_tailscale_serve_without_running_it() {
+    let output = run_binary(Path::new("."), &["dashboard", "--help"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let help = String::from_utf8(output.stdout).unwrap();
+    for option in ["--tailscale-serve", "--port", "--tmux-session"] {
+        assert!(help.contains(option), "{help}");
+    }
+    assert!(!help.contains("--host"), "{help}");
 }
 
 fn entry(number: u64, title: &str, state: State, worktree: Option<&str>, blockers: Vec<Blocker>) -> Entry {

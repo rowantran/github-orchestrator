@@ -16,7 +16,9 @@ npm run build
 
 `npm test` runs dependency-free unit tests for filtering, graph layout, counts, URL validation, and snapshot validation. `npm run build` checks JavaScript syntax; there are no generated frontend assets. No install step is needed.
 
-Opening `index.html` directly does not load tasks. The dashboard needs the local authenticated API.
+Opening `index.html` directly does not load tasks. The dashboard needs the server API.
+
+For tailnet access, use `gho dashboard --tailscale-serve [--port 8080]`. The command keeps the backend on loopback, manages a temporary Tailscale Serve proxy, and prints the node's HTTP URL. The same relative asset/API URLs work through the proxy. Tailnet access rules control who can read tasks and select panes; there is no dashboard login. See [Tailscale access](../README.md#tailscale-access) for requirements and shutdown behavior.
 
 ## Interface
 

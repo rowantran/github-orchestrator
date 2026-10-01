@@ -53,7 +53,7 @@ The repository and checkout are not configured: `gho` uses the git checkout you 
 
 Use another config directory with `GHO_CONFIG_DIR` or `gho --config-dir PATH`. Worktrees go wherever your Worktrunk configuration puts them.
 
-To update later: rerun the `cargo install` command and `pi update`.
+To update later: rerun the `cargo install` command and `pi update git:github.com/rowantran/github-orchestrator`.
 
 ## Use it through the orchestrator
 
@@ -107,6 +107,8 @@ gho task create --title "One bounded change" --body-file task.md \
 gho dashboard
 # Optional: choose a port and restrict focus to an exact tmux session name:
 gho dashboard --port 8080 --tmux-session agents
+# Optional: share through Tailscale Serve, with no manual proxy configuration:
+gho dashboard --tailscale-serve --port 8080 --tmux-session agents
 ```
 
 Memberships are GitHub labels named `gho:workstream:NAME`. They survive across machines and can also be edited on GitHub. Adding or removing a membership preserves all other labels. Names use letters, digits, `.`, `_`, `-`, and `/`, with each slash-separated segment starting with a letter or digit; the name is at most 35 characters. Names are case-insensitive on GitHub. A slash is just part of a name: `project-a/feature-1` does **not** automatically include a task in `project-a`. Add both memberships when you want both views. Empty workstreams remain selectable. Membership commands accept issue numbers or full issue URLs from this repository.
@@ -124,6 +126,16 @@ The dashboard's **All tasks** view includes all issues in the configured reposit
 Each refresh reads GitHub metadata for the repository's issues and Project tasks in batches. Large repositories can take longer to load. A refresh has a 90-second subprocess budget; failures keep the last successful view and show an error. Automatic refresh is off by default to avoid unnecessary GitHub API use; it waits for the preceding request to finish and pauses in a hidden tab.
 
 **Local access.** The dashboard binds only to `127.0.0.1`, uses an available port by default, and stops with Ctrl-C. It serves bundled assets with no frontend build or external CDN. API calls require a per-process token; foreign hosts and origins are rejected. No GitHub credentials are sent to the browser and no task database is created. For a remote machine, use an SSH tunnel with the same local and remote port, then open `http://127.0.0.1:PORT/`. Do not expose the dashboard through a public proxy.
+
+### Tailscale access
+
+Run `gho dashboard --tailscale-serve --tmux-session dune-storage` on the machine hosting the agent panes. It detects the node's Tailscale DNS name and prints an HTTP URL such as `http://rowan-v2-dev:8080/`. Both the short MagicDNS name and the full Tailscale DNS name are accepted. The browser machine must be on the tailnet and able to resolve the name.
+
+With this flag, `--port` selects the **tailnet HTTP port** (8080 when omitted or zero). The backend still binds only to `127.0.0.1`, on a separate OS-selected port. `gho` starts a temporary foreground `tailscale serve` process, confirms its mapping, and allows only the detected node names and the backend's loopback address. Host, Origin, API-token, and content-security checks remain enabled. It does not enable Funnel or expose a public internet endpoint.
+
+Tailscale must be installed, running, and logged in, with MagicDNS enabled and foreground Serve support (checked against Tailscale 1.102.2). Your OS user must have permission to configure Serve; `gho` does not run `sudo`, log you in, or change tailnet policy. It refuses a port already configured in Serve or Funnel rather than overwriting it. Other services are left unchanged. Ctrl-C or SIGTERM stops the owned Serve process during shutdown; an active GitHub refresh may take up to its 90-second deadline to finish. No persistent Serve mapping is created.
+
+**Access is controlled by your tailnet rules, not a dashboard login.** Anyone allowed to reach this port can read the Project's task data and select existing tmux panes. Restrict access accordingly. The page uses HTTP inside Tailscale's encrypted network, not HTTPS. Do not put a public proxy in front of it.
 
 ## Optional TaskNotes bridge
 

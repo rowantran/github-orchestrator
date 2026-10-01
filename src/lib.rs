@@ -11,6 +11,7 @@ pub mod github;
 pub mod notes;
 pub mod paths;
 pub mod process;
+pub mod tailscale;
 pub mod tmux;
 pub mod work;
 pub mod workspace;

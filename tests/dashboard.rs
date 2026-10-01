@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use github_orchestrator::dashboard::{Backend, DeadlineRunner, HttpServer, Router};
 use github_orchestrator::process::{Cmd, Runner};
+use github_orchestrator::tailscale::Plan;
 use github_orchestrator::{Error, Result};
 use serde_json::{Value, json};
 
@@ -38,17 +39,21 @@ impl Backend for Fake {
 }
 
 fn headers(router: &Router) -> Vec<(String, String)> {
-    let host = vec![("Host".into(), "127.0.0.1:8123".into())];
+    headers_for(router, "127.0.0.1:8123")
+}
+
+fn headers_for(router: &Router, authority: &str) -> Vec<(String, String)> {
+    let host = vec![("Host".into(), authority.into())];
     let index = router.route("GET", "/", &host, b"", &mut Fake::default());
     assert_eq!(index.status, 200);
     assert!(!index.body.contains("__GHO_TOKEN__"));
     let marker = "name=\"gho-token\" content=\"";
     let token = index.body.split(marker).nth(1).expect("token meta tag").split('"').next().unwrap();
     vec![
-        ("Host".into(), "127.0.0.1:8123".into()),
+        ("Host".into(), authority.into()),
         ("Content-Type".into(), "application/json".into()),
         ("X-GHO-Token".into(), token.into()),
-        ("Origin".into(), "http://127.0.0.1:8123".into()),
+        ("Origin".into(), format!("http://{authority}")),
     ]
 }
 
@@ -99,6 +104,180 @@ fn foreign_hosts_origins_missing_and_duplicate_tokens_cannot_read_or_focus() {
     }
     assert_eq!(fake.reads, 0);
     assert!(fake.focuses.is_empty());
+}
+
+struct TailscaleStatus;
+
+impl Runner for TailscaleStatus {
+    fn run(&self, cmd: &Cmd) -> Result<String> {
+        match cmd.argv.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+            ["tailscale", "status", "--json", "--peers=false"] => Ok(json!({
+                "BackendState":"Running",
+                "Self":{"DNSName":"rowan-v2-dev.example.ts.net."},
+                "CurrentTailnet":{"MagicDNSSuffix":"example.ts.net", "MagicDNSEnabled":true}
+            })
+            .to_string()),
+            ["tailscale", "serve", "status", "--json"] => Ok("{}".into()),
+            _ => panic!("Unexpected command; no real Tailscale calls are allowed: {:?}", cmd.argv),
+        }
+    }
+}
+
+fn tailscale_router(port: u16) -> Router {
+    let plan = Plan::prepare(&TailscaleStatus, port).unwrap();
+    Router::with_tailscale("127.0.0.1:8123", &plan)
+}
+
+fn assert_access_denied(router: &Router, headers: &[(String, String)]) {
+    let mut fake = Fake::default();
+    for (method, path, body) in [
+        ("GET", "/", ""),
+        ("GET", "/app.js", ""),
+        ("GET", "/style.css", ""),
+        ("GET", "/api/snapshot", ""),
+        ("POST", "/api/focus", r#"{"issue":42,"pane":"%9"}"#),
+    ] {
+        assert_eq!(
+            router.route(method, path, headers, body.as_bytes(), &mut fake).status,
+            403,
+            "{method} {path}: {headers:?}"
+        );
+    }
+    assert_eq!(fake.reads, 0);
+    assert!(fake.focuses.is_empty());
+}
+
+#[test]
+fn tailscale_allows_only_configured_short_and_fqdn_authorities_and_keeps_loopback_access() {
+    for (port, suffix) in [(0, ":8080"), (80, ""), (8080, ":8080"), (9080, ":9080")] {
+        let router = tailscale_router(port);
+        for authority in [
+            "127.0.0.1:8123".to_string(),
+            format!("rowan-v2-dev{suffix}"),
+            format!("rowan-v2-dev.example.ts.net{suffix}"),
+        ] {
+            let headers = headers_for(&router, &authority);
+            let mut fake = Fake::default();
+            for path in ["/", "/?workstream=project-a", "/app.js", "/style.css"] {
+                assert_eq!(router.route("GET", path, &headers, b"", &mut fake).status, 200, "{authority} {path}");
+            }
+            let snapshot = router.route("GET", "/api/snapshot", &headers, b"", &mut fake);
+            assert_eq!(snapshot.status, 200, "{authority}");
+            assert_eq!(serde_json::from_str::<Value>(&snapshot.body).unwrap()["repo"], "example/repo");
+            assert_eq!(
+                router.route("POST", "/api/focus", &headers, br#"{"issue":42,"pane":"%9"}"#, &mut fake).status,
+                200,
+                "{authority}"
+            );
+            assert_eq!(fake.reads, 1);
+            assert_eq!(fake.focuses, [(42, "%9".into())]);
+            // The additional authorities do not create a CORS preflight endpoint.
+            assert_eq!(router.route("OPTIONS", "/api/focus", &headers, b"", &mut fake).status, 405);
+        }
+    }
+}
+
+#[test]
+fn tailscale_rejects_foreign_missing_and_duplicate_hosts_and_foreign_or_duplicate_origins() {
+    let router = tailscale_router(8080);
+    let valid = headers_for(&router, "rowan-v2-dev.example.ts.net:8080");
+    for (header, value) in [
+        ("Host", "attacker.example:8080"),
+        ("Host", "other.example.ts.net:8080"),
+        ("Host", "child.rowan-v2-dev.example.ts.net:8080"),
+        ("Host", "rowan-v2-dev.example.ts.net.attacker.example:8080"),
+        ("Host", "rowan-v2-dev:8081"),
+        ("Host", "rowan-v2-dev.example.ts.net:8123"),
+        ("Host", "rowan-v2-dev"),
+        ("Host", "*.example.ts.net:8080"),
+        ("Origin", "http://attacker.example:8080"),
+        ("Origin", "http://other.example.ts.net:8080"),
+        ("Origin", "http://child.rowan-v2-dev.example.ts.net:8080"),
+        ("Origin", "http://rowan-v2-dev.example.ts.net.attacker.example:8080"),
+        ("Origin", "http://rowan-v2-dev:8081"),
+        ("Origin", "https://rowan-v2-dev.example.ts.net:8080"),
+        ("Origin", "http://rowan-v2-dev.example.ts.net:8080/path"),
+        ("Origin", "null"),
+        ("Origin", "*"),
+    ] {
+        let mut altered = valid.clone();
+        altered.iter_mut().find(|(key, _)| key == header).unwrap().1 = value.into();
+        assert_access_denied(&router, &altered);
+    }
+    let missing_host: Vec<_> = valid.iter().filter(|(key, _)| key != "Host").cloned().collect();
+    assert_access_denied(&router, &missing_host);
+    for header in ["Host", "Origin"] {
+        for value in [
+            valid.iter().find(|(key, _)| key == header).unwrap().1.clone(),
+            if header == "Host" { "rowan-v2-dev:8080" } else { "http://rowan-v2-dev:8080" }.into(),
+        ] {
+            let mut duplicate = valid.clone();
+            // Header names are case-insensitive, even when both values would be allowed alone.
+            duplicate.push((header.to_ascii_lowercase(), value));
+            assert_access_denied(&router, &duplicate);
+        }
+    }
+}
+
+#[test]
+fn tailscale_api_still_requires_one_valid_process_token() {
+    let router = tailscale_router(8080);
+    let other = tailscale_router(8080);
+    let mut fake = Fake::default();
+    for authority in ["rowan-v2-dev:8080", "rowan-v2-dev.example.ts.net:8080"] {
+        let valid = headers_for(&router, authority);
+        let mut wrong = valid.clone();
+        wrong.iter_mut().find(|(key, _)| key == "X-GHO-Token").unwrap().1 = "bad".into();
+        let missing = valid.iter().filter(|(key, _)| key != "X-GHO-Token").cloned().collect();
+        let mut duplicate = valid.clone();
+        let token = valid.iter().find(|(key, _)| key == "X-GHO-Token").unwrap().1.clone();
+        duplicate.push(("x-gho-token".into(), token));
+        for headers in [wrong, missing, duplicate, headers_for(&other, authority)] {
+            for (method, path, body) in
+                [("GET", "/api/snapshot", ""), ("POST", "/api/focus", r#"{"issue":42,"pane":"%9"}"#)]
+            {
+                assert_eq!(router.route(method, path, &headers, body.as_bytes(), &mut fake).status, 403);
+            }
+        }
+    }
+    assert_eq!(fake.reads, 0);
+    assert!(fake.focuses.is_empty());
+}
+
+#[test]
+fn forwarded_headers_never_allow_foreign_or_missing_hosts_and_local_mode_rejects_tailscale() {
+    for router in [Router::new("127.0.0.1:8123"), tailscale_router(8080)] {
+        let valid = headers(&router);
+        for authority in ["127.0.0.1:8123", "rowan-v2-dev:8080", "rowan-v2-dev.example.ts.net:8080"] {
+            for foreign in [Some("attacker.example:8080"), None] {
+                for forwarded in [
+                    vec![("Forwarded".into(), format!("for=100.64.0.1;host=\"{authority}\";proto=http"))],
+                    vec![("X-Forwarded-Host".into(), authority.into())],
+                    vec![
+                        ("Forwarded".into(), format!("host=\"{authority}\";proto=http")),
+                        ("X-Forwarded-Host".into(), authority.into()),
+                        ("X-Forwarded-Proto".into(), "http".into()),
+                    ],
+                ] {
+                    let mut altered: Vec<_> = valid.iter().filter(|(key, _)| key != "Host").cloned().collect();
+                    if let Some(host) = foreign {
+                        altered.push(("Host".into(), host.into()));
+                    }
+                    altered.extend(forwarded);
+                    assert_access_denied(&router, &altered);
+                }
+            }
+        }
+    }
+    let local = Router::new("127.0.0.1:8123");
+    for authority in ["rowan-v2-dev:8080", "rowan-v2-dev.example.ts.net:8080"] {
+        for header in ["Host", "Origin"] {
+            let mut altered = headers(&local);
+            altered.iter_mut().find(|(key, _)| key == header).unwrap().1 =
+                if header == "Host" { authority.into() } else { format!("http://{authority}") };
+            assert_access_denied(&local, &altered);
+        }
+    }
 }
 
 #[test]
@@ -245,6 +424,7 @@ fn sockets_serve_assets_and_authenticated_api_with_security_headers_and_local_ba
     let reply = response(&mut snapshot);
     assert_status(&reply, 200);
     assert!(reply.contains("\"repo\":\"example/repo\""));
+    assert!(!reply.contains("Access-Control-Allow-"));
     let body = r#"{"issue":42,"pane":"%9"}"#;
     let mut focus = server.authenticated(
         "POST",
@@ -252,9 +432,20 @@ fn sockets_serve_assets_and_authenticated_api_with_security_headers_and_local_ba
         &token,
         &format!("Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()),
     );
-    assert_status(&response(&mut focus), 200);
+    let reply = response(&mut focus);
+    assert_status(&reply, 200);
+    assert!(!reply.contains("Access-Control-Allow-"));
     let mut wrong = server.authenticated("GET", "/api/focus", &token, "\r\n");
     assert_status(&response(&mut wrong), 405);
+    let mut preflight = server.authenticated(
+        "OPTIONS",
+        "/api/focus",
+        &token,
+        &format!("Origin: http://{}\r\nAccess-Control-Request-Method: POST\r\n\r\n", server.address),
+    );
+    let reply = response(&mut preflight);
+    assert_status(&reply, 405);
+    assert!(!reply.contains("Access-Control-Allow-"));
 }
 
 #[test]
@@ -265,6 +456,7 @@ fn sockets_reject_unauthorized_headers_before_waiting_for_any_body() {
         String::new(),
         "X-GHO-Token: wrong\r\n".into(),
         format!("X-GHO-Token: {token}\r\nOrigin: https://attacker.invalid\r\n"),
+        format!("X-GHO-Token: {token}\r\nOrigin: http://{}\r\norigin: http://{}\r\n", server.address, server.address),
         format!("X-GHO-Token: {token}\r\nHost: attacker.invalid\r\n"),
         format!("X-GHO-Token: {token}\r\nX-GHO-Token: {token}\r\n"),
     ] {
@@ -395,6 +587,90 @@ fn sockets_serve_static_files_during_snapshot_and_discard_expired_focus_before_s
     let mut fresh = server.authenticated("POST", "/api/focus", &token, &request);
     assert_status(&response(&mut fresh), 200);
     assert_eq!(focuses.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn shutdown_during_health_check_discards_queued_requests_before_backend_dispatch() {
+    for (method, path, body) in [("GET", "/api/snapshot", ""), ("POST", "/api/focus", r#"{"issue":42,"pane":"%9"}"#)] {
+        let http = HttpServer::bind(0).unwrap();
+        let address = http.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let (entered_tx, entered) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::channel();
+        let (finished_tx, finished) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            let mut backend = Fake::default();
+            let result = http.run_checked(&mut backend, &stopping, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).map_err(|error| Error::msg(error.to_string()))?;
+                Ok(())
+            });
+            finished_tx.send(backend).unwrap();
+            result
+        });
+        let server = Running { address, stop, thread: Some(thread) };
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let token = server.token();
+        let extra = format!("Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let mut queued = Vec::new();
+        let mut full = false;
+        // A 503 while dispatch is paused proves the bounded queue contains complete,
+        // authenticated requests. A sleep alone would not prove a request reached the queue.
+        for _ in 0..32 {
+            let mut stream = server.authenticated(method, path, &token, &extra);
+            stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            match stream.peek(&mut [0; 1]) {
+                Ok(0) => {} // The connection limit can close an excess connection before parsing.
+                Ok(_) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                    assert_status(&response(&mut stream), 503);
+                    full = true;
+                    break;
+                }
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    queued.push(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Err(error) => panic!("{method} {path}: {error}"),
+            }
+        }
+        assert!(full, "{method} {path}: requests did not fill the queue while the health check was paused");
+        server.stop.store(true, Ordering::Relaxed);
+        release.send(()).unwrap();
+        drop(server); // Joins the server; Running also provides cleanup on assertion failure.
+        let backend = finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(backend.reads, 0, "a snapshot started after shutdown was requested");
+        assert!(backend.focuses.is_empty(), "a pane was focused after shutdown was requested");
+        drop(queued);
+    }
+}
+
+#[test]
+fn server_health_error_stops_an_idle_server_promptly_and_preserves_the_error() {
+    let server = HttpServer::bind(0).unwrap();
+    assert!(server.local_addr().unwrap().ip().is_loopback());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::clone(&stop);
+    let (finished_tx, finished) = mpsc::sync_channel(1);
+    let thread = thread::spawn(move || {
+        let mut checks = 0;
+        let mut backend = LocalFake { fake: Fake::default(), _local: Rc::new(()) };
+        let result = server.run_checked(&mut backend, &stopping, || {
+            checks += 1;
+            if checks == 1 { Ok(()) } else { Err(Error::msg("Tailscale Serve stopped unexpectedly.")) }
+        });
+        finished_tx.send((result, checks, backend.fake.reads, backend.fake.focuses)).unwrap();
+    });
+    let result = finished.recv_timeout(Duration::from_secs(2));
+    // Make even the failure path shut down cleanly instead of leaving a background server alive.
+    stop.store(true, Ordering::Relaxed);
+    thread.join().unwrap();
+    let (result, checks, reads, focuses) = result.expect("health failure must stop the idle server within two seconds");
+    assert_eq!(result.unwrap_err().to_string(), "Tailscale Serve stopped unexpectedly.");
+    assert_eq!(checks, 2);
+    assert_eq!(reads, 0);
+    assert!(focuses.is_empty());
 }
 
 struct Recorded {

@@ -1,6 +1,7 @@
 import { test as base, expect } from "@playwright/test";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
+import { createServer } from "node:net";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, chmodSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve, join } from "node:path";
@@ -9,6 +10,8 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const project = resolve(here, "../..");
 let reportedSocketDenial = false;
+export const TAILSCALE_HOST = "rowan-v2-dev";
+export const TAILSCALE_DNS = `${TAILSCALE_HOST}.example.ts.net`;
 export const PREFIX = "gho:workstream:";
 export const XSS_TITLE = 'Blocked <img src=x onerror="window.__ghoXss=1">';
 export const XSS_BODY = '<script>window.__ghoXss=1</script>\n<img src=x onerror="window.__ghoXss=1">\n[unsafe](javascript:window.__ghoXss=1)';
@@ -70,8 +73,29 @@ async function stop(child) {
   try { await ended; } finally { clearTimeout(timer); }
 }
 
+async function unusedPort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const port = server.address().port;
+  await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  return port;
+}
+
+export function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    // kill(0) also succeeds for zombies, which no longer own a proxy connection.
+    const stat = `/proc/${pid}/stat`;
+    return !existsSync(stat) || !/\) [ZX] /.test(readFileSync(stat, "utf8"));
+  } catch { return false; }
+}
+
 export const test = base.extend({
-  app: async ({}, use, testInfo) => {
+  dashboardMode: ["local", { option: true }],
+  app: async ({ dashboardMode }, use, testInfo) => {
     const binary = resolve(process.env.GHO_E2E_BINARY || join(project, "target/debug/gho"));
     if (!existsSync(binary)) throw new Error(`Build the real dashboard first: cargo build --locked (missing ${binary})`);
     const root = mkdtempSync(join(tmpdir(), "gho-e2e-"));
@@ -100,7 +124,9 @@ export const test = base.extend({
       writeFileSync(join(config, "config.toml"), 'owner = "worker"\n');
       writeFileSync(join(config, "repos/acme/app.toml"), 'project_url = "https://github.com/orgs/acme/projects/7"\nbase_branch = "main"\n');
       writeFileSync(join(root, "state.json"), JSON.stringify(initialState()));
-      for (const tool of ["gh", "tmux"]) {
+      writeFileSync(join(root, "tailscale-config.json"), "{}\n");
+      // Always shadow tailscale, including in local tests: never reach a real daemon.
+      for (const tool of ["gh", "tmux", "tailscale"]) {
         copyFileSync(join(here, `fake-${tool}.py`), join(bin, tool));
         chmodSync(join(bin, tool), 0o755);
       }
@@ -137,11 +163,13 @@ export const test = base.extend({
         tmux("select-pane", "-t", firstPane);
       }
       testInfo.annotations.push({ type: "tmux", description: tmuxMode });
-      child = spawn(binary, ["dashboard", "--port", "0", "--tmux-session", "gho-e2e"], { cwd: repo, env, stdio: ["ignore", "pipe", "pipe"] });
+      const tailscale = dashboardMode === "tailscale";
+      const port = tailscale ? await unusedPort() : 0;
+      child = spawn(binary, ["dashboard", "--port", String(port), "--tmux-session", "gho-e2e", ...(tailscale ? ["--tailscale-serve"] : [])], { cwd: repo, env, stdio: ["ignore", "pipe", "pipe"] });
       child.stdout.on("data", (chunk) => { serverLog += chunk; });
       child.stderr.on("data", (chunk) => { serverLog += chunk; });
       const url = await new Promise((resolveUrl, reject) => {
-        const timeout = setTimeout(() => reject(new Error(`Dashboard did not start. Rebuild target/debug/gho with all assets.\n${serverLog}`)), 10_000);
+        const timeout = setTimeout(() => finish(new Error(`Dashboard did not start. Rebuild target/debug/gho with all assets.\n${serverLog}`)), tailscale ? 15_000 : 10_000);
         const finish = (error, value) => {
           clearTimeout(timeout);
           child.stdout.off("data", onData);
@@ -149,14 +177,32 @@ export const test = base.extend({
           child.off("error", onError);
           error ? reject(error) : resolveUrl(value);
         };
-        const onData = () => { const match = serverLog.match(/http:\/\/127\.0\.0\.1:\d+\//); if (match) finish(null, match[0]); };
+        // Match the public URL, not the separately printed loopback backend.
+        const onData = () => { const match = serverLog.match(/Dashboard: (http:\/\/[^\s]+\/)/); if (match) finish(null, match[1]); };
         const onExit = () => finish(new Error(`Dashboard exited; rebuild the binary if the command is missing.\n${serverLog}`));
         const onError = (error) => finish(error);
         child.stdout.on("data", onData); child.once("exit", onExit); child.once("error", onError);
       });
       const app = {
-        url, root, firstPane, secondPane, tmuxMode,
+        url, root, firstPane, secondPane, tmuxMode, port,
+        pid: child.pid,
         cli: (...args) => run(binary, args),
+        serveStatus: () => JSON.parse(run("tailscale", ["serve", "status", "--json"])),
+        serveSession: () => JSON.parse(readFileSync(join(root, "tailscale-session.json"), "utf8")),
+        proxyRequests: () => lines(join(root, "tailscale-requests.jsonl")),
+        async terminate(requestedSignal = "SIGTERM") {
+          if (child.exitCode !== null || child.signalCode !== null) return { code: child.exitCode, signal: child.signalCode };
+          const ended = once(child, "exit");
+          child.kill(requestedSignal);
+          let timer;
+          try {
+            const [code, signal] = await Promise.race([
+              ended,
+              new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Dashboard ignored ${requestedSignal}.\n${serverLog}`)), 5000); }),
+            ]);
+            return { code, signal };
+          } finally { clearTimeout(timer); }
+        },
         state: () => JSON.parse(readFileSync(join(root, "state.json"), "utf8")),
         replaceState: (state) => {
           // Only fixture data changes; the browser still loads the real snapshot API.
@@ -183,15 +229,30 @@ export const test = base.extend({
         },
       };
       await use(app);
-      expect(lines(join(root, "rejected.jsonl")), "Every gh/tmux operation must match the strict fixture").toEqual([]);
+      expect(lines(join(root, "rejected.jsonl")), "Every gh/tmux/tailscale operation must match the strict fixture").toEqual([]);
+      if (!tailscale) expect(app.calls("tailscale"), "Local mode must not invoke tailscale").toEqual([]);
     } finally {
       await stop(child);
+      // Recover an orphan only if startup or shutdown failed. Never touch a real CLI/daemon.
+      const sessionPath = join(root, "tailscale-session.json");
+      if (existsSync(sessionPath)) {
+        const { pid } = JSON.parse(readFileSync(sessionPath, "utf8"));
+        const commandPath = `/proc/${pid}/cmdline`;
+        try {
+          if (processAlive(pid) && existsSync(commandPath)
+            && readFileSync(commandPath, "utf8").split("\0").includes(join(bin, "tailscale"))) {
+            process.kill(pid, "SIGKILL");
+          }
+        } catch (error) {
+          if (!["ENOENT", "ESRCH"].includes(error.code)) throw error; // Already exited.
+        }
+      }
       if (tmuxMode === "real") {
         try { tmux("kill-server"); } catch { /* Server may not have started. Never fall back to a default socket. */ }
       }
       if (testInfo.status !== testInfo.expectedStatus) {
         await testInfo.attach("server.log", { body: serverLog, contentType: "text/plain" });
-        for (const name of ["gh-calls.jsonl", "tmux-calls.jsonl", "rejected.jsonl"]) {
+        for (const name of ["gh-calls.jsonl", "tmux-calls.jsonl", "tailscale-calls.jsonl", "tailscale-requests.jsonl", "tailscale-session.json", "tailscale-config.json", "rejected.jsonl"]) {
           if (existsSync(join(root, name))) await testInfo.attach(name, { body: readFileSync(join(root, name)), contentType: "application/x-ndjson" });
         }
       }
@@ -203,10 +264,13 @@ export const test = base.extend({
     const unexpectedRequests = [];
     const githubVisits = [];
     context.on("page", (page) => page.on("pageerror", (error) => errors.push(error.message)));
+    // Only the exact app origin is allowed. Chromium maps the fake node to loopback.
+    const appUrl = new URL(app.url);
+    expect(["127.0.0.1", TAILSCALE_HOST]).toContain(appUrl.hostname);
     // Fulfil GitHub link clicks locally. No browser request reaches an external host.
     await context.route("**/*", (route) => {
       const url = new URL(route.request().url());
-      if (url.origin === new URL(app.url).origin) return route.continue();
+      if (url.origin === appUrl.origin) return route.continue();
       if (url.origin === "https://github.com" && route.request().isNavigationRequest()) {
         githubVisits.push(url.href);
         return route.fulfill({ contentType: "text/html", body: "<!doctype html><title>Intercepted GitHub link</title>Offline link target" });

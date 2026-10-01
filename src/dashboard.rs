@@ -18,7 +18,7 @@ use crate::github::GitHub;
 use crate::process::{Cmd, Runner};
 use crate::tmux::Tmux;
 use crate::workspace::Workspace;
-use crate::{Error, Result, ensure, workstreams};
+use crate::{Error, Result, ensure, tailscale, workstreams};
 
 const INDEX: &str = include_str!("../dashboard/index.html");
 const APP: &str = include_str!("../dashboard/app.js");
@@ -115,28 +115,58 @@ impl Backend for Live<'_> {
     }
 }
 
-/// Start an HTTP server bound strictly to IPv4 loopback. Port zero asks the OS for a free port.
+/// Always bind the backend to loopback. Tailscale mode owns a temporary foreground proxy;
+/// its external port is independent of the OS-selected private backend port.
 pub fn serve(
     config: &Config,
     runner: &dyn Runner,
     port: u16,
+    tailscale_serve: bool,
     session: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<()> {
-    let server = HttpServer::bind(port)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    if tailscale_serve {
+        let stop = Arc::clone(&stop);
+        ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))
+            .map_err(|error| Error::msg(format!("Cannot install dashboard shutdown handler: {error}")))?;
+    }
+    let plan = tailscale_serve.then(|| tailscale::Plan::prepare(runner, port)).transpose()?;
+    let mut server = HttpServer::bind(if tailscale_serve { 0 } else { port })?;
+    if plan.as_ref().is_some_and(|plan| server.local_addr().is_ok_and(|addr| addr.port() == plan.port())) {
+        // Bind the replacement before releasing the first socket so its random port must differ.
+        server = HttpServer::bind(0)?;
+    }
     let authority = server.local_addr()?;
-    writeln!(out, "Dashboard: http://{authority}/")?;
+    if let Some(plan) = &plan {
+        server.router = Router::with_tailscale(&authority.to_string(), plan);
+    }
+    let mut proxy = plan.as_ref().map(|plan| plan.start(runner, authority, &stop)).transpose()?;
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    if let Some(plan) = &plan {
+        writeln!(out, "Dashboard: {}", plan.url())?;
+        writeln!(out, "Local backend: http://{authority}/")?;
+        writeln!(out, "Tailnet access: anyone allowed to reach this port can read tasks and select tmux panes.")?;
+        writeln!(out, "Press Ctrl-C to stop the dashboard and its temporary Tailscale Serve session.")?;
+    } else {
+        writeln!(out, "Dashboard: http://{authority}/")?;
+        writeln!(out, "Local access only. Press Ctrl-C to stop.")?;
+    }
     writeln!(out, "Repository: {} · Project: {}", config.repo, config.project_url)?;
-    writeln!(out, "Local access only. Press Ctrl-C to stop.")?;
     out.flush()?;
     let mut backend = Live { config, runner, session, visible: HashSet::new() };
-    server.run(&mut backend, &AtomicBool::new(false))
+    server.run_checked(&mut backend, &stop, || match &mut proxy {
+        Some(proxy) => proxy.check(),
+        None => Ok(()),
+    })
 }
 
 /// HTTP routing is separate from the live adapters so security checks are testable in isolation.
 pub struct Router {
-    authority: String,
-    origin: String,
+    authorities: Vec<String>,
+    origins: Vec<String>,
     token: String,
 }
 
@@ -169,7 +199,21 @@ impl Reply {
 
 impl Router {
     pub fn new(authority: &str) -> Self {
-        Self { authority: authority.into(), origin: format!("http://{authority}"), token: Uuid::new_v4().to_string() }
+        Self {
+            authorities: vec![authority.into()],
+            origins: vec![format!("http://{authority}")],
+            token: Uuid::new_v4().to_string(),
+        }
+    }
+
+    /// Only the validated node names from Tailscale are added, never forwarded headers or wildcards.
+    pub fn with_tailscale(authority: &str, plan: &tailscale::Plan) -> Self {
+        let mut router = Self::new(authority);
+        for authority in plan.authorities() {
+            router.authorities.push(authority.clone());
+            router.origins.push(format!("http://{authority}"));
+        }
+        router
     }
 
     /// Reject foreign hosts (DNS rebinding), foreign origins and unauthenticated API requests.
@@ -218,10 +262,12 @@ impl Router {
     }
 
     fn authorize(&self, url: &str, headers: &[(String, String)]) -> Option<Reply> {
-        if header(headers, "host") != Some(self.authority.as_str()) {
-            return Some(Reply::error(403, "Unexpected Host. Open the printed loopback URL."));
+        if !header(headers, "host").is_some_and(|host| self.authorities.iter().any(|allowed| allowed == host)) {
+            return Some(Reply::error(403, "Unexpected Host. Open the printed dashboard URL."));
         }
-        if headers.iter().any(|(key, value)| key.eq_ignore_ascii_case("origin") && value != &self.origin) {
+        if headers.iter().any(|(key, _)| key.eq_ignore_ascii_case("origin"))
+            && !header(headers, "origin").is_some_and(|origin| self.origins.iter().any(|allowed| allowed == origin))
+        {
             return Some(Reply::error(403, "Cross-origin requests are not allowed."));
         }
         if url.split('?').next().unwrap_or(url).starts_with("/api/")
@@ -292,9 +338,18 @@ impl HttpServer {
         self.listener.local_addr()
     }
 
-    /// Serve until `stop` is set. The stop flag also gives socket tests a clean shutdown without
-    /// a public shutdown endpoint. Production uses the process's normal Ctrl-C handling.
+    /// Serve until `stop` is set, without a public shutdown endpoint.
     pub fn run(&self, backend: &mut dyn Backend, stop: &AtomicBool) -> Result<()> {
+        self.run_checked(backend, stop, || Ok(()))
+    }
+
+    /// Also stop if an owned proxy exits. The check runs on the backend thread, not request workers.
+    pub fn run_checked(
+        &self,
+        backend: &mut dyn Backend,
+        stop: &AtomicBool,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
         let stopping = AtomicBool::new(false);
         thread::scope(|scope| {
             let shutdown = StopOnDrop(&stopping);
@@ -352,11 +407,17 @@ impl HttpServer {
                 Ok(())
             });
             while !stop.load(Ordering::Relaxed) {
+                check()?;
                 let mut pending = match receiver.recv_timeout(POLL_INTERVAL) {
                     Ok(pending) => pending,
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 };
+                // Shutdown can arrive while a request waits in the queue or the health check runs.
+                // Do not start new GitHub work or select a pane after observing that signal.
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 // Do not start another 90-second snapshot for a tab that already spent most of
                 // its browser deadline waiting behind a previous refresh.
                 let reply = if pending.queued.elapsed() > MAX_QUEUE_WAIT {
