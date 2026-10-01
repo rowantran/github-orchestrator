@@ -15,8 +15,8 @@ use crate::notes::{Notes, Status, note_path};
 use crate::paths::{expand_user, resolve};
 use crate::process::{Cmd, Runner, System, which};
 use crate::work::{Blocker, Entry, Issues, State, classify, survey};
-use crate::workspace::{Workspace, locate, origin_default_branch};
-use crate::{Error, Result, bail, ensure};
+use crate::workspace::{Created, Workspace, locate, origin_default_branch};
+use crate::{Error, Result, bail, brief, ensure};
 
 #[derive(Debug, Parser)]
 #[command(name = "gho", version, about = "Your GitHub issue queue → ready work → Worktrunk worktrees.")]
@@ -45,7 +45,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Create a ready issue's branch and worktree; prints JSON
+    /// Create a ready issue's branch and worktree with a task brief in .gho/brief.md; prints JSON
     Worktree {
         /// Issue number or URL
         issue: String,
@@ -134,15 +134,20 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
         Command::Doctor => doctor(&config, &github, &workspace, out),
         Command::Ready { all, json } => display_ready(&survey(&config, &github, &workspace)?, all, json, out),
         Command::Worktree { issue, base } => {
-            let number = worktree_number(&config, &issue)?;
-            let base = match base {
-                Some(base) => Some(base),
+            let reference = IssueRef::new(&config.repo, worktree_number(&config, &issue)?)?;
+            let (title, base) = match base {
+                Some(base) => (github.issue(&reference)?.title, Some(base)),
                 None => {
-                    let entry = classify(&config, &github, &workspace, &IssueRef::new(&config.repo, number)?)?;
-                    stack_branch(&config, &entry)?.map(|branch| workspace.fetch(&branch)).transpose()?
+                    let entry = classify(&config, &github, &workspace, &reference)?;
+                    let base = stack_branch(&config, &entry)?.map(|branch| workspace.fetch(&branch)).transpose()?;
+                    (entry.title, base)
                 }
             };
-            print_json(out, &workspace.create(number, base.as_deref())?)
+            let created = workspace.create(reference.number(), base.as_deref())?;
+            let brief = write_brief(&config, &reference, &title, &created).map_err(|error| {
+                Error::msg(format!("Created the worktree at {}, but not its brief: {error}", created.path))
+            })?;
+            print_json(out, &Started { created, brief })
         }
         Command::Task(TaskCommand::Create { title, body_file, blocked_by, note }) => {
             let body = fs::read_to_string(&body_file)
@@ -185,6 +190,27 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
             }
         }
     }
+}
+
+/// The result of `gho worktree`.
+#[derive(Serialize)]
+struct Started {
+    #[serde(flatten)]
+    created: Created,
+    /// The task brief to give implementer and reviewer agents.
+    brief: PathBuf,
+}
+
+fn write_brief(config: &Config, reference: &IssueRef, title: &str, created: &Created) -> Result<PathBuf> {
+    let facts = brief::Facts {
+        number: reference.number(),
+        title,
+        url: &reference.url(),
+        repo: &config.repo,
+        branch: &created.branch,
+        base_branch: &created.base_branch,
+    };
+    brief::write(Path::new(&created.path), &brief::render(&facts))
 }
 
 fn print_json(out: &mut dyn Write, value: &impl Serialize) -> Result<()> {

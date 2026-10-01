@@ -7,7 +7,7 @@
 You ↔ orchestrator agent (Pi + the github-orchestrator skill)
         │ gho task create      → GitHub issue + Project + blocked-by links
         │ gho ready --json     → reads GitHub queue, open PRs by branch, local branches
-        │ gho worktree N       → git fetch + wt switch --create
+        │ gho worktree N       → git fetch + wt switch --create + .gho/brief.md
         │ gho config           → agent models from the config
         ▼
    implementer agents, one per worktree, each in a tmux window
@@ -36,10 +36,11 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 | `src/domain.rs` | Value types: `IssueRef`, `Issue`, `PullRequest`, and the state enums. |
 | `src/github.rs` | Looks up the Project ID from the configured Project URL once per run. GitHub reads (queue, issue, blockers, linked PRs) and issue creation, through `gh`. Responses are decoded into strict types, so missing or partial API data is an error instead of looking like an empty queue. |
 | `src/work.rs` | `survey()` (the queue) and `classify()` (one issue): the `State` of each issue and its blockers: `blocked`, `ready { stack_on }`, `in_progress`, `ready_for_review`, `done` or `closed`. The `Issues` and `Branches` traits let tests replace GitHub and git. |
-| `src/workspace.rs` | Git and Worktrunk: find the checkout and its GitHub repository from the working directory, fetch the base, list worktrees, create the issue's worktree. |
+| `src/workspace.rs` | Git and Worktrunk: find the checkout and its GitHub repository from the working directory, fetch the base, list worktrees, create the issue's worktree, find the branch its pull request targets. |
+| `src/brief.rs` | The task brief: fills in `agent-context/brief.md` (compiled in) and writes it to `.gho/brief.md` in the new worktree, next to a `.gitignore` that ignores `.gho/`. |
 | `src/process.rs` | Subprocesses as argument arrays with timeouts. The `Runner` trait lets tests replace `gh`. |
 | `src/notes.rs`, `obsidian-plugin/` | Optional TaskNotes bridge: note-to-issue links and completion request/receipt files. |
-| `agent-context/` | All model-facing text: the orchestrator skill (`SKILL.md`) and the implementer and reviewer instructions it appends to their system prompts (`implementer.md`, `reviewer.md`). |
+| `agent-context/` | All model-facing text: the orchestrator skill (`SKILL.md`), the implementer and reviewer instructions it appends to their system prompts (`implementer.md`, `reviewer.md`), and the task brief template that `gho worktree` fills in (`brief.md`). |
 | `package.json` | Pi package manifest, so `pi install git:github.com/rowantran/github-orchestrator` installs the skill. |
 
 ## Decisions
@@ -49,5 +50,6 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 - **The working directory selects the repository.** The checkout and repository are never configured: `gho` uses the git checkout it runs in and the GitHub repository of its `origin`, so one installation serves every repository.
 - **No local state.** "In progress" means the issue's branch exists; "ready for review" means an open PR comes from it. Deleting the branch (`wt remove -D`) makes an issue without a PR ready again.
 - **Only ready work starts.** An issue is ready when every blocker is done or ready for review. Blockers under review must form one chain of PRs, and the new branch starts from the top of it (`origin/<branch>`), so stacks build on pushed work that others can see. `gho worktree N` refuses other issues; `--base` is the explicit override.
+- **The brief is deterministic.** `gho worktree` writes each issue's task brief from a template, so every agent gets the same facts in the same form, and the orchestrator does not write briefs itself. The brief lives in the worktree, in a self-ignoring `.gho/` directory, so it needs no shared Git configuration and is removed with the worktree.
 - **PRs are found by branch.** GitHub ignores closing keywords on PRs that target a non-default branch, so a stacked PR is never linked to its issue. `gho` looks up open PRs by head branch `<owner>/gh-N` in the configured repository instead.
 - **Completed means `COMPLETED`.** Issues closed as not planned or duplicate never unblock dependents or complete notes.

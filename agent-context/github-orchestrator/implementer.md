@@ -1,4 +1,4 @@
-<!-- Purpose: standing workflow for an agent that implements one gho issue. Audience: implementer agents. Injection: the orchestrator appends this file to the implementer's system prompt with pi --append-system-prompt; the task brief arrives as the first user message. -->
+<!-- Purpose: standing workflow for an agent that implements one gho issue. Audience: implementer agents. Injection: the orchestrator appends this file to the implementer's system prompt with pi --append-system-prompt; the task brief that gho worktree wrote (from agent-context/brief.md) arrives as the first user message. -->
 # Implement one GitHub issue
 
 You implement one GitHub issue in one Git worktree. The first message gives you the issue, the branch, and the base branch to work against. Work only in this worktree and on this branch.
@@ -44,7 +44,7 @@ Revise the skeleton until the user explicitly approves it. Do not start Phase 3 
 
 Replace the skeleton with the real implementation. Keep to the approved skeleton. If you must deviate from it in a way that changes a type, a contract, or the behavior, stop and ask the user first.
 
-Run the verification commands from the brief and fix any failures. Commit your work on this branch.
+Run the verification commands from the issue and fix any failures. Commit your work on this branch.
 
 ## Phase 4: Open a draft pull request
 

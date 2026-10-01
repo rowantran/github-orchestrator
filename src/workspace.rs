@@ -52,8 +52,12 @@ pub fn origin_default_branch(checkout: &Path, runner: &dyn Runner) -> Option<Str
 pub struct Created {
     pub issue: u64,
     pub branch: String,
+    /// What the worktree started from, as given or fetched, e.g. `origin/main`.
     pub base: String,
     pub base_commit: String,
+    /// The branch the pull request targets: the branch `base` names, or the configured base branch when
+    /// `base` is a commit or tag.
+    pub base_branch: String,
     pub path: String,
 }
 
@@ -130,6 +134,7 @@ impl<'a> Workspace<'a> {
         let commit = self
             .git(&["rev-parse", "--verify", &format!("{base}^{{commit}}")], 60)
             .map_err(|_| Error::msg(format!("Unknown base {base:?}; use a branch, tag or commit.")))?;
+        let base_branch = self.base_branch(&base)?;
         let checkout = self.config.checkout.to_string_lossy();
         let wt =
             ["wt", "-C", &checkout, "switch", "--create", &branch, "--base", &commit, "--no-cd", "--format", "json"];
@@ -137,6 +142,13 @@ impl<'a> Workspace<'a> {
         let Some(path) = self.worktrees()?.remove(&branch) else {
             bail!("Worktrunk did not report a worktree for {branch}.");
         };
-        Ok(Created { issue: number, branch, base, base_commit: commit, path })
+        Ok(Created { issue: number, branch, base, base_commit: commit, base_branch, path })
+    }
+
+    /// The branch on origin that `base` names (`origin/X` or a local `X`), else the configured base branch.
+    fn base_branch(&self, base: &str) -> Result<String> {
+        let name = self.git(&["rev-parse", "--symbolic-full-name", base], 60)?;
+        let branch = name.strip_prefix("refs/remotes/origin/").or_else(|| name.strip_prefix("refs/heads/"));
+        Ok(branch.unwrap_or(&self.config.base_branch).to_string())
     }
 }

@@ -4,7 +4,7 @@
 
 1. **Register work:** create GitHub issues assigned to you, added to your Project, with native "blocked by" links.
 2. **Find ready work:** list open issues in your queue that you can start: every blocker is done, or has an open pull request to stack on.
-3. **Create a worktree:** make branch `<owner>/gh-N` for a ready issue in a new Worktrunk worktree, from the latest base branch or stacked on its blockers' pull requests.
+3. **Create a worktree:** make branch `<owner>/gh-N` for a ready issue in a new Worktrunk worktree, from the latest base branch or stacked on its blockers' pull requests. The worktree gets a task brief for the issue's agents in `.gho/brief.md`, which Git ignores.
 
 The agent you talk to does everything else. It launches an implementer agent in each worktree, in its own tmux window. The implementer first writes a skeleton (pseudocode and stubs at the real paths) and agrees on it with you in that window. Then it implements the change and opens a draft PR, and the orchestrator launches a reviewer agent on it. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells the orchestrator how; `implementer.md` and `reviewer.md` next to it are the other agents' standing instructions. This repository is a Pi package that ships them.
 
@@ -80,6 +80,8 @@ gho config                  # config as JSON, including agents.implementer_model
 Only `ready` issues can be picked up. A ready issue's `stack_on` lists its blockers that are ready for review, bottom first; `gho worktree N` starts from the last one's branch, or from the latest base branch when the list is empty. Blockers under review must lie on one chain of pull requests (each based on the branch below it), because a branch can only start from one of them; otherwise the issue is blocked. `gho` finds pull requests by head branch, because GitHub does not link stacked pull requests to issues through "Closes #N". Only issues in the configured repository have branches, so blockers elsewhere are never `in_progress` or `ready_for_review`.
 
 `gho ready` lists open issues assigned to you in the Project, with each blocker's state, local branch, worktree and pull requests. `gho worktree N` refuses issues that are not ready unless you pass `--base`.
+
+**Task brief.** `gho worktree N` fills in the template [`agent-context/brief.md`](agent-context/brief.md) and writes it to `.gho/brief.md` in the new worktree. The brief gives the issue, the branch, and the base branch that the pull request targets. The base branch is the branch that the worktree started from, or the configured base branch when `--base` is a commit or tag. `.gho/` contains its own `.gitignore`, so the brief is never committed. The orchestrator gives the brief to the implementer and reviewer agents as their first message.
 
 ## Optional TaskNotes bridge
 
