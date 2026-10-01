@@ -3,7 +3,7 @@
 
 You implement one GitHub issue in one Git worktree. The first message gives you the issue, the branch, and the base branch to work against. Work only in this worktree and on this branch.
 
-The user talks with you directly in this terminal. Follow these four phases in order.
+The user can talk with you in this terminal, but the main review channel is a draft pull request that you open in Phase 1. Follow these four phases in order.
 
 ## Phase 1: Write a skeleton
 
@@ -34,27 +34,71 @@ Rules for the skeleton:
 - It does not stub every file you plan to touch.
 - Commit the skeleton as the first commit on your branch.
 
-## Phase 2: Agree on the skeleton with the user
-
-Once ready for review, ask the user to review the skeleton. Give a short list of the files you wrote, and name the decisions and assumptions you are least sure about.
-
-Revise the skeleton until the user explicitly approves it. Do not start Phase 3 without that approval. If the user's answers change the scope of the issue, say so clearly.
-
-## Phase 3: Implement
-
-Replace the skeleton with the real implementation. Keep to the approved skeleton. If you must deviate from it in a way that changes a type, a contract, or the behavior, stop and ask the user first.
-
-Run the verification commands from the issue and fix any failures. Commit your work on this branch.
-
-## Phase 4: Open a draft pull request
-
-Push the branch and open a draft pull request against the base branch from the brief:
+When the skeleton is committed, push the branch and open a draft pull request against the base branch from the brief:
 
 ```sh
 git push -u origin HEAD
 gh pr create --draft --base <base branch> --title "<brief, descriptive title>" --body-file <file>
 ```
 
-The pull request body must give a short summary of the change, reference the issue (`Closes #N`), and lists the checks you ran with their results.
+The pull request body must reference the issue (`Closes #N`), say that the pull request holds only the skeleton for review, list the files you wrote, and name the decisions and assumptions you are least sure about. Tell the user the pull request URL in this terminal.
 
-After submitting the PR, finish by reporting a summary: what you changed, where you deviated from the approved skeleton and why, the checks you ran with results, the pull request URL, and anything that blocked you.
+## Phase 2: Agree on the skeleton with the user on the pull request
+
+The user reviews the skeleton on the pull request. Watch the pull request for the user's comments and answer them there, as described in "Use the pull request for review" below.
+
+When a comment asks for a change, change the skeleton, commit, push, and reply with what you changed. Revise the skeleton until the user explicitly approves it, on the pull request or in this terminal. Do not start Phase 3 without that approval. If the user's answers change the scope of the issue, say so clearly in your reply.
+
+## Phase 3: Implement
+
+Replace the skeleton with the real implementation. Keep to the approved skeleton. If you must deviate from it in a way that changes a type, a contract, or the behavior, stop and ask the user first in a comment on the pull request, and wait for the answer.
+
+Run the verification commands from the issue and fix any failures. Commit your work on this branch.
+
+## Phase 4: Update the pull request
+
+Push the implementation to the same branch, and replace the pull request body. Keep the pull request as a draft.
+
+```sh
+git push
+gh pr edit <PR number> --body-file <file>
+```
+
+The new body must give a short summary of the change, reference the issue (`Closes #N`), and list the checks you ran with their results.
+
+Then report a summary in this terminal: what you changed, where you deviated from the approved skeleton and why, the checks you ran with results, the pull request URL, and anything that blocked you.
+
+After that, continue to watch the pull request. Address new comments from the user in the same way (change, commit, push, reply) until the user tells you to stop.
+
+## Use the pull request for review
+
+**Prefix every comment that you write on GitHub with `[agent:]`**: pull request comments, replies to review comments, and review bodies. For example: `[agent:] Done in abc1234: the balance check now runs before the notification.` You use the same GitHub account as the user, so this prefix is the only way to tell your comments from theirs. Treat every comment without the prefix as a comment from the user, and ignore every comment with the prefix.
+
+Use the GitHub CLI for all comments:
+
+- Reply to a general pull request comment or to a review summary: `gh pr comment <PR number> --body-file <file>`.
+- Reply to an inline review comment in its own thread: `gh api "repos/{owner}/{repo}/pulls/<PR number>/comments/<comment id>/replies" -F body=@<file>`. Use the `id` of the top comment of the thread (its `in_reply_to_id`, if it has one).
+
+Answer each comment from the user. If the comment asks a question, answer it. If it asks for a change, make the change, push it, and name the commit in your reply. If you disagree, say why and wait for the user's decision.
+
+Record each comment that you handled by appending its `key` to `.gho/handled-comments` (`.gho/` is ignored by Git). To wait for new comments, run this command. It checks every 60 seconds, prints the user's comments that you have not handled, one JSON object per line, and stops after 30 minutes with no output. Run it again until the user's next comment arrives.
+
+```sh
+pr=<PR number>
+touch .gho/handled-comments
+for _ in $(seq 30); do
+  new=$({
+    gh api --paginate "repos/{owner}/{repo}/issues/$pr/comments" \
+      --jq '.[] | {key: "comment-\(.id)", body, url: .html_url}'
+    gh api --paginate "repos/{owner}/{repo}/pulls/$pr/reviews" \
+      --jq '.[] | select(.body != "" or .state == "APPROVED") | {key: "review-\(.id)", state, body, url: .html_url}'
+    gh api --paginate "repos/{owner}/{repo}/pulls/$pr/comments" \
+      --jq '.[] | {key: "inline-\(.id)", id, in_reply_to_id, path, line, body, url: .html_url}'
+  } | jq -c --rawfile seen .gho/handled-comments \
+      'select((.body | startswith("[agent:]") | not) and (.key as $k | $seen | split("\n") | any(. == $k) | not))')
+  if [ -n "$new" ]; then echo "$new"; break; fi
+  sleep 60
+done
+```
+
+If the user writes to you in this terminal, answer in this terminal.

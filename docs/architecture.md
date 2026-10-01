@@ -11,7 +11,7 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
         │ gho config           → agent models from the config
         ▼
    implementer agents, one per worktree, each in a tmux window
-   (skeleton → agreed with you in that window → implementation → push + draft PR)
+   (skeleton → draft PR → agreed with you in PR comments → implementation pushed to the PR)
         │
         ▼
    reviewer agent per PR → orchestrator relays findings → you review and merge
