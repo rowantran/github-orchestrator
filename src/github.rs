@@ -26,7 +26,7 @@ static PR_URL: LazyLock<Regex> = LazyLock::new(|| {
 });
 static LOGIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9-]*$").unwrap());
 
-const PR_FIELDS: &str = "id number url state merged baseRefName headRefName \
+const PR_FIELDS: &str = "id number url state merged isDraft baseRefName headRefName \
     mergeCommit { oid } repository { nameWithOwner } headRepository { nameWithOwner }";
 
 fn metadata(detail: impl Display) -> Error {
@@ -125,6 +125,7 @@ struct PullRequestNode {
     url: String,
     state: PullRequestState,
     merged: bool,
+    is_draft: bool,
     #[serde(deserialize_with = "text")]
     base_ref_name: String,
     #[serde(deserialize_with = "text")]
@@ -616,6 +617,7 @@ fn pull_request(node: PullRequestNode) -> Result<PullRequest> {
         url: node.url,
         repo: node.repository.name_with_owner,
         state: node.state,
+        draft: node.is_draft,
         base: node.base_ref_name,
         head: node.head_ref_name,
         merge_commit,

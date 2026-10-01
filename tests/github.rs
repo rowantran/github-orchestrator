@@ -43,7 +43,7 @@ fn rest_issue(number: u64, repo: &str, assignee: &str) -> Value {
 fn pr_node(number: u64, state: &str, repo: &str) -> Value {
     json!({
         "id": format!("PR_{repo}_{number}"), "number": number, "url": format!("https://github.com/{repo}/pull/{number}"),
-        "state": state, "merged": state == "MERGED", "baseRefName": "main", "headRefName": BRANCH,
+        "state": state, "merged": state == "MERGED", "isDraft": false, "baseRefName": "main", "headRefName": BRANCH,
         "mergeCommit": if state == "MERGED" { json!({"oid": "a".repeat(40)}) } else { Value::Null },
         "repository": {"nameWithOwner": repo}, "headRepository": {"nameWithOwner": repo},
     })
@@ -678,8 +678,17 @@ fn open_pull_request_is_found_by_head_branch_in_this_repository() {
     ];
     f.state().branch_prs = Some(HashMap::from([("worker/gh-1".into(), connection_pages(prs, 2))]));
     let pr = f.github().open_pull_request("worker/gh-1").unwrap().unwrap();
-    assert_eq!((pr.number, pr.head.as_str(), pr.state), (9, "worker/gh-1", PullRequestState::Open));
+    assert_eq!((pr.number, pr.head.as_str(), pr.state, pr.draft), (9, "worker/gh-1", PullRequestState::Open, false));
     assert_eq!(f.github().open_pull_request("worker/gh-2").unwrap(), None);
+}
+
+#[test]
+fn draft_pull_requests_are_marked_as_drafts() {
+    let f = Fixture::new();
+    let mut pr = branch_pr(9, "worker/gh-1", Some(REPO));
+    pr["isDraft"] = json!(true);
+    f.state().branch_prs = Some(HashMap::from([("worker/gh-1".into(), connection_pages(vec![pr], 100))]));
+    assert!(f.github().open_pull_request("worker/gh-1").unwrap().unwrap().draft);
 }
 
 #[test]

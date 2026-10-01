@@ -17,7 +17,7 @@ You decide the rest with the user: which tasks to create, how to launch and stee
 Run `gho` inside the repository's checkout or one of its worktrees: it works on the GitHub repository of the checkout's `origin`. If it reports a missing config, ask the user to run `gho init` there and fill in the file it names.
 
 - `gho task create --title TITLE --body-file FILE [--blocked-by N]... [--note VAULT_PATH]`: create an issue assigned to the user, add it to the configured project, and record native "blocked by" dependency information. Use this when breaking up the plan into a series of issues.
-- `gho ready --json`: Use this when determining which issue (if any) to start next. Add `--all` to also see `blocked`, `in_progress` (branch exists, no PR) and `ready_for_review` (open PR, in `pull_request`) issues.
+- `gho ready --json`: Use this when determining which issue (if any) to start next. Add `--all` to also see `blocked`, `in_progress` (branch exists or draft PR open) and `ready_for_review` (published PR, in `pull_request`) issues.
 - `gho worktree N [--base REF]`: Use this once ready to start implementing issue N. It uses Worktrunk (`wt`) to create a branch `<owner>/gh-N` in a new worktree for a ready issue, and writes the task brief for the issue's agents to `.gho/brief.md` in the worktree (Git ignores it). It prints JSON with the worktree `path`, the `brief` path, and the `base_branch` that the pull request will target.
 - `gho config`: prints the user's `gho` config as JSON. `agents.implementer_model` and `agents.reviewer_model` are the Pi models to launch agents with.
 
@@ -48,5 +48,5 @@ Once the plan is complete:
    ```
 
    Use absolute paths. Do not pass the path of `implementer.md` or the brief directly: if Pi cannot read the file, it silently uses the path itself as the prompt text.
-5. Watch progress for all active implementers. Answer other questions, steer (`tmux send-keys -t <window> '<message>' Enter`), stop, or relaunch as needed. Bubble up to the user for information when facing ambiguity that you can't safely resolve on your own. If the implementer is looking for input on the pseudocode skeleton before implementing the real code, always bubble up to the user. Do NOT approve the skeleton yourself.
-6. When an implementer has opened its draft PR (the issue shows as `ready_for_review`), launch a reviewer in the same worktree the same way, but with `--model <reviewer_model>`, `reviewer.md`, and "Review " prepended to the window title.
+5. Watch progress for all active implementers. Answer other questions, steer (`tmux send-keys -t <window> '<message>' Enter`), stop, or relaunch as needed. Bubble up to the user for information when facing ambiguity that you can't safely resolve on your own. The user reviews the pseudocode skeleton in comments on the implementer's draft PR. When an implementer opens that PR, give the user its URL. Do NOT approve the skeleton yourself, and do not comment on the PR: the implementer uses the same GitHub account as the user, and treats every comment without the `[agent:]` prefix as a comment from the user.
+6. When an implementer publishes its PR, launch a reviewer in the same worktree the same way, but with `--model <reviewer_model>`, `reviewer.md`, and "Review " prepended to the window title.

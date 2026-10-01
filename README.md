@@ -6,9 +6,9 @@
 2. **Find ready work:** list open issues in your queue that you can start: every blocker is done, or has an open pull request to stack on.
 3. **Create a worktree:** make branch `<owner>/gh-N` for a ready issue in a new Worktrunk worktree, from the latest base branch or stacked on its blockers' pull requests. The worktree gets a task brief for the issue's agents in `.gho/brief.md`, which Git ignores.
 
-The agent you talk to does everything else. It launches an implementer agent in each worktree, in its own tmux window. The implementer first writes a skeleton (pseudocode and stubs at the real paths) and agrees on it with you in that window. Then it implements the change and opens a draft PR, and the orchestrator launches a reviewer agent on it. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells the orchestrator how; `implementer.md` and `reviewer.md` next to it are the other agents' standing instructions. This repository is a Pi package that ships them.
+The agent you talk to does everything else. It launches an implementer agent in each worktree, in its own tmux window. The implementer first commits a skeleton (pseudocode and stubs at the real paths) and opens a draft PR with it. You review the skeleton in PR comments, and the implementer answers there, with every comment prefixed `[agent:]`. When you approve, it implements the change, pushes it to the same PR, and marks the PR ready for review. Then the orchestrator launches a reviewer agent on it. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells the orchestrator how; `implementer.md` and `reviewer.md` next to it are the other agents' standing instructions. This repository is a Pi package that ships them.
 
-GitHub is the only task store. `gho` keeps no local state: a task is "in progress" when its branch exists, and "ready for review" when an open pull request comes from that branch.
+GitHub is the only task store. `gho` keeps no local state: a task is "in progress" when its branch exists or it has a draft pull request, and "ready for review" when an open pull request that is not a draft comes from that branch.
 
 ## Install and configure
 
@@ -72,8 +72,8 @@ gho config                  # config as JSON, including agents.implementer_model
 | --- | --- |
 | `done` | Closed as *completed*. |
 | `closed` | Closed as not planned or duplicate. Never unblocks dependents. |
-| `ready_for_review` | An open pull request (draft or not) comes from `<owner>/gh-N`. |
-| `in_progress` | The branch `<owner>/gh-N` exists locally, with no open pull request. |
+| `ready_for_review` | An open pull request that is not a draft comes from `<owner>/gh-N`. |
+| `in_progress` | An open draft pull request comes from `<owner>/gh-N`, or the branch exists locally with no open pull request. |
 | `ready` | No branch yet, and every blocker is `done` or `ready_for_review`. |
 | `blocked` | Anything else. |
 

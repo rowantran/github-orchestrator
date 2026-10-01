@@ -276,6 +276,7 @@ fn in_review(number: u64) -> State {
         pull_request: LinkedPullRequest {
             url: format!("https://github.com/acme/app/pull/{number}0"),
             state: PullRequestState::Open,
+            draft: false,
             head: format!("Owner/gh-{number}"),
             base: "main".into(),
         },
