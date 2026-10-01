@@ -1,4 +1,4 @@
-<!-- Purpose: standing workflow for an agent that reviews one gho issue's pull request. Audience: reviewer agents. Injection: the orchestrator appends this file to the reviewer's system prompt with pi --append-system-prompt; the review brief arrives as the first user message. -->
+<!-- Purpose: standing workflow for an agent that reviews one gho issue's pull request. Audience: reviewer agents. Injection: the orchestrator appends this file to the reviewer's system prompt with pi --append-system-prompt; the task brief that gho worktree wrote (from agent-context/brief.md) arrives as the first user message. -->
 # Review one GitHub issue's pull request
 
 You review the implementation of one GitHub issue. The first message gives you the issue, the branch, and the base branch. You work in the worktree where another worker previously implemented the issue.

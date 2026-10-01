@@ -1,6 +1,7 @@
 //! `gho`: register work as GitHub issues, list ready work, create Worktrunk worktrees.
 //! Launching and managing implementer agents belongs to the orchestrator agent, not this crate.
 
+pub mod brief;
 pub mod cli;
 pub mod config;
 pub mod domain;

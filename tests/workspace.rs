@@ -116,6 +116,7 @@ fn worktree_starts_from_latest_fetched_base() {
     let created = workspace.create(42, None).unwrap();
     assert_eq!(created.branch, "rowantran/gh-42");
     assert_eq!((created.base.as_str(), created.base_commit.as_str()), ("origin/main", latest.as_str()));
+    assert_eq!(created.base_branch, "main");
     let path = Path::new(&created.path);
     assert_eq!(git(path, &["rev-parse", "HEAD"]), latest);
     assert_eq!(git(path, &["branch", "--show-current"]), "rowantran/gh-42");
@@ -134,6 +135,10 @@ fn worktree_can_stack_on_unmerged_branch() {
     let upstream_commit = commit(Path::new(&upstream.path), "feature.txt", "unmerged upstream work");
     let stacked = workspace.create(2, Some("rowantran/gh-1")).unwrap();
     assert_eq!((stacked.base.as_str(), stacked.base_commit.as_str()), ("rowantran/gh-1", upstream_commit.as_str()));
+    assert_eq!(stacked.base_branch, "rowantran/gh-1");
+    // A commit names no branch, so the pull request targets the configured base branch.
+    let from_commit = workspace.create(3, Some(&upstream_commit)).unwrap();
+    assert_eq!(from_commit.base_branch, "main");
     assert_eq!(fs::read_to_string(Path::new(&stacked.path).join("feature.txt")).unwrap(), "unmerged upstream work\n");
 }
 
@@ -151,6 +156,7 @@ fn fetch_returns_the_latest_pushed_branch_to_stack_on() {
     if has_wt() {
         let stacked = workspace.create(2, Some("origin/rowantran/gh-1")).unwrap();
         assert_eq!(stacked.base_commit, pushed);
+        assert_eq!(stacked.base_branch, "rowantran/gh-1");
     }
 }
 
