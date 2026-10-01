@@ -1,7 +1,7 @@
 //! Git and Worktrunk operations on the configured checkout.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -18,6 +18,33 @@ static REMOTE: LazyLock<Regex> = LazyLock::new(|| {
 /// `owner/repo` (lowercase) for a github.com remote URL without credentials; otherwise `None`.
 pub fn github_remote_repo(url: &str) -> Option<String> {
     REMOTE.captures(url).map(|captures| captures[1].to_lowercase())
+}
+
+fn git_in(runner: &dyn Runner, cwd: &Path, args: &[&str]) -> Result<String> {
+    let argv = std::iter::once("git").chain(args.iter().copied());
+    Ok(runner.run(&Cmd::new(argv).cwd(cwd))?.trim().to_string())
+}
+
+/// The root of the git checkout that contains `cwd`, and its origin's GitHub repository (`owner/repo`,
+/// lowercase). `None` when `cwd` is not in a git checkout.
+pub fn locate(cwd: &Path, runner: &dyn Runner) -> Result<Option<(PathBuf, String)>> {
+    let root = match git_in(runner, cwd, &["rev-parse", "--show-toplevel"]) {
+        Ok(root) => Path::new(&root).canonicalize()?,
+        Err(error) if error.exit_code() == Some(128) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let origin = git_in(runner, &root, &["remote", "get-url", "origin"])
+        .map_err(|_| Error::msg(format!("The checkout {} has no origin remote.", root.display())))?;
+    match github_remote_repo(&origin) {
+        Some(repo) => Ok(Some((root, repo))),
+        None => bail!("The origin of {} is not a github.com repository: {origin}", root.display()),
+    }
+}
+
+/// The branch origin's HEAD points to, if git knows it (`git clone` records it).
+pub fn origin_default_branch(checkout: &Path, runner: &dyn Runner) -> Option<String> {
+    let head = git_in(runner, checkout, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]).ok()?;
+    head.strip_prefix("origin/").map(String::from)
 }
 
 /// The result of `gho worktree`.
