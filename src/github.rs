@@ -120,6 +120,24 @@ struct ProjectItem {
 }
 
 #[derive(Deserialize)]
+struct ProjectCandidate {
+    #[serde(deserialize_with = "text")]
+    id: String,
+    #[serde(rename = "isArchived")]
+    _is_archived: bool,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(deserialize_with = "present")]
+    content: Option<Value>,
+}
+
+impl Node for ProjectCandidate {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Deserialize)]
 struct Identified {
     #[serde(deserialize_with = "text")]
     id: String,
@@ -531,45 +549,52 @@ impl<'a> GitHub<'a> {
         Ok(result)
     }
 
-    /// All repository issues in the configured Project, regardless of assignee or state. Membership
-    /// reads use `includeArchived: true`, in batches of fifty rather than one request per historical
-    /// issue. Only Project members are hydrated, also in batches.
+    /// All repository issues in the configured Project, regardless of assignee or state. Enumerate
+    /// both archived and active Project items, never repository issue or pull request history.
+    /// Only matching issues are hydrated, in batches of fifty.
     pub fn project_issues(&self) -> Result<Vec<Issue>> {
         let project_id = self.project()?.id.clone();
-        let endpoint = format!("repos/{}/issues?state=all&per_page=100", self.repo);
+        let query = "query($project: ID!, $cursor: String) { node(id: $project) { __typename \
+            ... on ProjectV2 { id items(first: 100, after: $cursor, archivedStates: [ARCHIVED, NOT_ARCHIVED]) { \
+            totalCount pageInfo { hasNextPage endCursor } nodes { id isArchived type content { __typename \
+            ... on Issue { id number url repository { nameWithOwner } } } } } } } }";
+        let candidates: Vec<ProjectCandidate> = paginate(|cursor| {
+            let mut variables = vec![("project", Var::Str(&project_id))];
+            if let Some(cursor) = cursor {
+                variables.push(("cursor", Var::Str(cursor)));
+            }
+            let mut data = self.graphql(query, &variables)?;
+            let node = data.get_mut("node").ok_or_else(|| metadata("project node"))?;
+            check!(node.get("__typename").and_then(Value::as_str) == Some("ProjectV2"), "project node type");
+            check!(node.get("id").and_then(Value::as_str) == Some(project_id.as_str()), "project node identity");
+            parse(node.get_mut("items").map(Value::take).unwrap_or_default(), "project items")
+        })?;
         let mut seen = HashSet::new();
-        let mut references = Vec::new();
-        for candidate in self.rest_pages(&endpoint)? {
-            if candidate.get("pull_request").is_some() {
+        let mut content_ids = HashSet::new();
+        let mut members = Vec::new();
+        for candidate in candidates {
+            let expected_type = match candidate.kind.as_str() {
+                "ISSUE" => "Issue",
+                "PULL_REQUEST" => "PullRequest",
+                "DRAFT_ISSUE" => "DraftIssue",
+                "REDACTED" => return Err(metadata("redacted project item")),
+                _ => return Err(metadata("unknown project item type")),
+            };
+            let content = candidate.content.ok_or_else(|| metadata("project item content"))?;
+            check!(
+                content.get("__typename").and_then(Value::as_str) == Some(expected_type),
+                "project item content type"
+            );
+            if expected_type != "Issue" {
                 continue;
             }
-            let candidate: QueueCandidate = parse(candidate, "project issue")?;
-            let reference = issue_ref(&candidate.html_url, candidate.number)?;
-            check!(reference.repo().eq_ignore_ascii_case(&self.repo), "project issue repository");
-            check!(seen.insert(reference.clone()), "duplicate issue in paginated project issues");
-            check!(
-                candidate.state.eq_ignore_ascii_case("open") || candidate.state.eq_ignore_ascii_case("closed"),
-                "issue state"
-            );
-            references.push(reference);
-        }
-        let membership = "projectItems(first: 100, includeArchived: true) { \
-            totalCount pageInfo { hasNextPage endCursor } nodes { id project { id } } }";
-        let mut members = Vec::new();
-        for chunk in references.chunks(BATCH_SIZE) {
-            for (reference, mut value) in chunk.iter().zip(self.issue_batch(chunk, membership)?) {
-                let first = value.get_mut("projectItems").map(Value::take).unwrap_or_default();
-                let items = self.issue_connection_from(
-                    reference,
-                    "projectItems",
-                    "id project { id }",
-                    ", includeArchived: true",
-                    Some(first),
-                )?;
-                let project_ids = project_ids(items, &project_id)?;
-                if project_ids.contains(&project_id) {
-                    members.push((reference.clone(), project_ids));
-                }
+            let identity: IssueIdentity = parse(content.clone(), "project issue")?;
+            let reference = issue_ref(&identity.url, identity.number)?;
+            check_issue_identity(&reference, &content)?;
+            check!(seen.insert(reference.clone()), "duplicate issue in paginated project items");
+            check!(content_ids.insert(identity._id.clone()), "duplicate project issue identity");
+            if reference.repo().eq_ignore_ascii_case(&self.repo) {
+                members.push((reference, identity._id));
             }
         }
         // Hydrate only Project members. Assignees and linked PRs share the issue-fields request;
@@ -583,8 +608,9 @@ impl<'a> GitHub<'a> {
         let mut result = Vec::new();
         for chunk in members.chunks(BATCH_SIZE) {
             let references: Vec<_> = chunk.iter().map(|(reference, _)| reference.clone()).collect();
-            for ((reference, project_ids), value) in chunk.iter().zip(self.issue_batch(&references, &fields)?) {
-                result.push(self.read_issue(reference, Some(project_ids.clone()), Some(value))?);
+            for ((reference, id), value) in chunk.iter().zip(self.issue_batch(&references, &fields)?) {
+                check!(value.get("id").and_then(Value::as_str) == Some(id.as_str()), "project issue identity changed");
+                result.push(self.read_issue(reference, Some(vec![project_id.clone()]), Some(value))?);
             }
         }
         result.sort_by(|a, b| a.reference.cmp(&b.reference));

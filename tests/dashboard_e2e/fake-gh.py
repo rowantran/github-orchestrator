@@ -126,11 +126,32 @@ def batched_pull_requests(state, query, values):
     return {"data": {"repository": result}}
 
 
+def project_items(state, query, values):
+    require(values == {"project": "PVT_queue"}, "unexpected Project parameters")
+    expected = (
+        "query($project: ID!, $cursor: String) { node(id: $project) { __typename "
+        "... on ProjectV2 { id items(first: 100, after: $cursor, archivedStates: [ARCHIVED, NOT_ARCHIVED]) { "
+        "totalCount pageInfo { hasNextPage endCursor } nodes { id isArchived type content { __typename "
+        "... on Issue { id number url repository { nameWithOwner } } } } } } } }"
+    )
+    require(" ".join(query.split()) == expected, "unknown Project items query; both archive states are required")
+    nodes = [{
+        "id": f'PVTI_{spec["repo"]}_{spec["number"]}', "type": "ISSUE",
+        # Task 5 is explicitly archived, not merely closed or named "archived".
+        "isArchived": spec["repo"] == "acme/app" and spec["number"] == 5,
+        "content": {"__typename": "Issue", **identity(spec)},
+    } for spec in state["issues"].values() if spec["project"]]
+    require(len(nodes) <= 100, "fixture Project requires pagination")
+    return {"data": {"node": {"__typename": "ProjectV2", "id": "PVT_queue", "items": connection(nodes)}}}
+
+
 def graphql(state, arguments):
     values = params(arguments)
     query = values.pop("query")
     require(query.lstrip().startswith("query("), "mutations are forbidden")
     require("cursor" not in values, "unexpected pagination cursor")
+    if "node(id: $project)" in query:
+        return project_items(state, query, values)
     if re.search(r"\bissue_\d+:", query):
         return batched_issues(state, query, values)
     if re.search(r"\bpr_\d+:", query):
@@ -187,13 +208,13 @@ def respond(state):
     endpoint, extra = ARGS[3], ARGS[4:]
     if endpoint == "graphql":
         return graphql(state, extra)
-    if endpoint in ("repos/acme/app/issues?state=all&per_page=100",
-                    "repos/acme/app/issues?state=open&assignee=worker&per_page=100"):
+    if endpoint == "repos/acme/app/issues?state=open&assignee=worker&per_page=100":
         require(extra == ["--paginate", "--slurp"], "unpaginated issues")
-        specs = [spec for spec in state["issues"].values() if spec["repo"] == "acme/app"]
-        if "state=open" in endpoint:
-            specs = [spec for spec in specs if spec["state"] == "OPEN" and "worker" in spec["assignees"]]
+        specs = [spec for spec in state["issues"].values()
+                 if spec["repo"] == "acme/app" and spec["state"] == "OPEN" and "worker" in spec["assignees"]]
         return [[rest_issue(spec) for spec in specs]]
+    if re.fullmatch(r"repos/[^/]+/[^/]+/issues(?:\?.*)?", endpoint):
+        raise ValueError("repository issue history listing is forbidden; enumerate Project items instead")
     dependency = re.fullmatch(r"repos/([^/]+/[^/]+)/issues/(\d+)/dependencies/blocked_by\?per_page=100", endpoint)
     if dependency:
         require(extra == ["--paginate", "--slurp"], "unpaginated dependencies")

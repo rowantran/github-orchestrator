@@ -16,6 +16,17 @@ async function selectTask(page, number) {
 test("root shows all six states, completed work, and only local dependency edges", async ({ page, app }, testInfo) => {
   const snapshotRequest = page.waitForRequest((request) => request.url() === `${app.url}api/snapshot`);
   const snapshot = await app.open(page);
+  const calls = app.calls();
+  expect(calls.filter((args) => args[0] === "api" && /^repos\/[^/]+\/[^/]+\/issues(?:\?|$)/.test(args[3])),
+    "A snapshot must enumerate Project members, not repository issue/PR history").toEqual([]);
+  const projectQueries = calls.filter((args) => args[3] === "graphql")
+    .map((args) => args.find((value) => value.startsWith("query=")))
+    .filter((query) => query?.includes("... on ProjectV2"));
+  expect(projectQueries, "A snapshot must read the configured Project directly").toHaveLength(1);
+  expect(projectQueries[0]).toContain("node(id: $project)");
+  expect(projectQueries[0]).toContain("items(first: 100, after: $cursor, archivedStates: [ARCHIVED, NOT_ARCHIVED])");
+  expect(snapshot.tasks.find((item) => item.number === 5), "The archived, unassigned Project task must remain visible")
+    .toMatchObject({ title: "Completed archived task", state: "done" });
   expect(snapshot.repo).toBe("acme/app");
   expect(snapshot.tasks.map(({ number, state }) => [number, state])).toEqual([
     [1, "blocked"], [2, "ready"], [3, "in_progress"], [4, "ready_for_review"], [5, "done"], [6, "closed"],

@@ -86,12 +86,44 @@ struct State {
     /// Open pull request connection pages by head branch; `None` makes the repository inaccessible.
     branch_prs: Option<HashMap<String, Vec<Value>>>,
     queue_pages: Value,
+    project_pages: Option<Vec<Value>>,
+    project_node: Value,
     label_pages: Value,
     label_write_response: Option<Value>,
     project: Value,
     before: Hook,
     graphql_errors: Vec<Value>,
     raw_output: Option<String>,
+}
+
+/// Project enumeration returns only identity and type data, never issue bodies or PR history.
+fn project_pages(state: &State, size: usize) -> Vec<Value> {
+    let mut items = Vec::new();
+    for ((repo, number, field), pages) in &state.connections {
+        if *field != "projectItems" {
+            continue;
+        }
+        for item in pages.iter().flat_map(|page| page["nodes"].as_array().unwrap()) {
+            if item["project"]["id"] != PROJECT {
+                continue;
+            }
+            let content = state.issues.get(&(repo.clone(), *number)).map_or(Value::Null, |issue| {
+                let mut content = json!({"__typename": "Issue"});
+                for field in ["id", "number", "url", "repository"] {
+                    if let Some(value) = issue.get(field) {
+                        content[field] = value.clone();
+                    }
+                }
+                content
+            });
+            items.push(json!({
+                "id": item["id"], "type": "ISSUE", "isArchived": item.get("isArchived").unwrap_or(&json!(false)),
+                "content": content,
+            }));
+        }
+    }
+    items.sort_by_key(|item| item["content"]["number"].as_u64().unwrap_or_default());
+    connection_pages(items, size)
 }
 
 struct Fixture(RefCell<State>);
@@ -105,6 +137,8 @@ impl Fixture {
             dependencies: HashMap::new(),
             branch_prs: Some(HashMap::new()),
             queue_pages: json!([[]]),
+            project_pages: None,
+            project_node: json!({"__typename": "ProjectV2", "id": PROJECT}),
             label_pages: json!([[]]),
             label_write_response: None,
             project: json!({"id": PROJECT, "url": PROJECT_URL, "title": "Queue"}),
@@ -161,7 +195,18 @@ impl Fixture {
             if endpoint == "graphql" {
                 let params: HashMap<&str, &str> = args[4..].iter().filter_map(|a| a.split_once('=')).collect();
                 let query = params["query"];
-                let data = if query.contains("issue_") {
+                let data = if query.contains("node(id: $project)") {
+                    assert_eq!(params["project"], PROJECT);
+                    assert!(query.contains("archivedStates: [ARCHIVED, NOT_ARCHIVED]"));
+                    let cursor = params.get("cursor").copied().unwrap_or("cursor-0");
+                    let page: usize = cursor.split('-').nth(1).unwrap().parse().unwrap();
+                    let pages = state.project_pages.clone().unwrap_or_else(|| project_pages(&state, 100));
+                    let mut node = state.project_node.clone();
+                    if node.is_object() {
+                        node["items"] = pages[page].clone();
+                    }
+                    json!({"node": node})
+                } else if query.contains("issue_") {
                     let repo = format!("{}/{}", params["owner"], params["name"]).to_lowercase();
                     let pattern = regex::Regex::new(r"(issue_[0-9]+): issue\(number: ([0-9]+)\)").unwrap();
                     let mut repository = serde_json::Map::new();
@@ -913,42 +958,216 @@ fn project_issues_include_closed_unassigned_and_other_assignees_and_archived_mem
     f.add_issue(Spec { project: None, ..spec(3) });
     f.add_issue(Spec { state: "CLOSED", reason: json!("NOT_PLANNED"), ..spec(4) });
     f.state().connections.insert((REPO.into(), 4, "assignees"), connection_pages(vec![], 100));
-    f.state().queue_pages = json!([
-        [rest_issue(4, REPO, ""), rest_issue(3, REPO, OWNER)],
-        [rest_issue(2, REPO, "other"), rest_issue(1, REPO, OWNER)]
-    ]);
-    // REST assignees must be valid; the unassigned case is an empty array.
-    f.state().queue_pages[0][0]["assignees"] = json!([]);
+    f.state().connections.get_mut(&(REPO.into(), 2, "projectItems")).unwrap()[0]["nodes"][0]["isArchived"] =
+        json!(true);
+    let pages = project_pages(&f.0.borrow(), 2);
+    f.state().project_pages = Some(pages);
     let issues = f.github().project_issues().unwrap();
     assert_eq!(issues.iter().map(|i| i.reference.number()).collect::<Vec<_>>(), [1, 2, 4]);
     assert!(issues[1].completed());
     assert!(issues[2].assignees.is_empty());
     assert_eq!(issues[1].assignees, ["other"]);
     let calls = f.calls();
-    assert!(calls.iter().flatten().any(|a| a == "repos/acme/app/issues?state=all&per_page=100"));
-    assert!(
-        calls.iter().flatten().filter(|a| a.contains("projectItems(")).all(|a| a.contains("includeArchived: true"))
-    );
+    assert!(!calls.iter().flatten().any(|a| a.contains("issues?state=") || a.contains("projectItems(")));
+    assert_eq!(calls.iter().flatten().filter(|a| a.contains("archivedStates: [ARCHIVED, NOT_ARCHIVED]")).count(), 2);
+    assert_eq!(issues[1].project_ids, [PROJECT]);
 }
 
 #[test]
-fn project_listing_only_hydrates_members_and_reuses_membership_pages() {
+fn project_listing_only_hydrates_members_without_reading_other_memberships() {
     let f = Fixture::new();
     f.add_issue(spec(1));
     f.add_issue(Spec { project: None, ..spec(2) });
-    f.state().queue_pages = json!([[rest_issue(1, REPO, OWNER), rest_issue(2, REPO, OWNER)]]);
+    f.add_issue(Spec { repo: "outside/repo", ..spec(3) });
     assert_eq!(f.github().project_issues().unwrap().len(), 1);
     let calls = f.calls();
-    let member_queries: Vec<_> = calls.iter().filter(|call| call.iter().any(|arg| arg.contains("issue_1:"))).collect();
-    assert_eq!(member_queries.iter().filter(|call| call.iter().any(|arg| arg.contains("projectItems("))).count(), 1);
-    let nonmember_queries: Vec<_> =
-        calls.iter().filter(|call| call.iter().any(|arg| arg.contains("issue_2:"))).collect();
-    assert_eq!(nonmember_queries.len(), 1);
-    assert!(nonmember_queries[0].iter().any(|arg| arg.contains("projectItems(")));
-    assert!(!calls.iter().flatten().any(|arg| arg.contains("issues/2/dependencies")));
-    // Unknown membership still fails, even if the issue would otherwise be outside the Project.
-    f.state().connections.get_mut(&(REPO.into(), 2, "projectItems")).unwrap()[0] = Value::Null;
-    fails(f.github().project_issues(), "projectItems");
+    assert_eq!(calls.iter().filter(|call| call.iter().any(|arg| arg.contains("issue_1:"))).count(), 1);
+    assert!(!calls.iter().flatten().any(|arg| {
+        arg.contains("projectItems(")
+            || arg.contains("issue_2:")
+            || arg.contains("issue_3:")
+            || arg.contains("issues/2/dependencies")
+            || arg.contains("issues/3/dependencies")
+            || arg.contains("issues?state=")
+    }));
+}
+
+#[test]
+fn project_listing_skips_known_nonissues_and_filters_cross_repository_issues() {
+    let f = Fixture::new();
+    f.add_issue(spec(1));
+    f.add_issue(Spec { repo: "outside/repo", ..spec(2) });
+    let mut nodes = project_pages(&f.0.borrow(), 100)[0]["nodes"].as_array().unwrap().clone();
+    nodes.extend([
+        json!({"id": "PVTI_pr", "type": "PULL_REQUEST", "isArchived": true, "content": {"__typename": "PullRequest"}}),
+        json!({"id": "PVTI_draft", "type": "DRAFT_ISSUE", "isArchived": false, "content": {"__typename": "DraftIssue"}}),
+    ]);
+    f.state().project_pages = Some(connection_pages(nodes, 1));
+    let issues = f.github().project_issues().unwrap();
+    assert_eq!(issues.iter().map(|issue| issue.reference.number()).collect::<Vec<_>>(), [1]);
+    let calls = f.calls();
+    assert_eq!(calls.iter().filter(|call| call.iter().any(|arg| arg.contains("node(id: $project)"))).count(), 4);
+    assert!(!calls.iter().flatten().any(|arg| arg.contains("pullRequests(") || arg.contains("issue_2:")));
+}
+
+#[test]
+fn project_listing_validates_project_node_even_when_empty() {
+    let f = Fixture::new();
+    assert!(f.github().project_issues().unwrap().is_empty());
+    for node in [
+        Value::Null,
+        json!({}),
+        json!({"__typename": "Repository", "id": PROJECT}),
+        json!({"__typename": "ProjectV2", "id": "PVT_wrong"}),
+        json!({"__typename": "ProjectV2", "id": null}),
+    ] {
+        let f = Fixture::new();
+        f.state().project_node = node.clone();
+        assert!(f.github().project_issues().is_err(), "{node}");
+    }
+    let f = Fixture::new();
+    f.state().graphql_errors = vec![json!({"message": "partial Project response"})];
+    fails(f.github().project_issues(), "GraphQL error");
+}
+
+#[test]
+fn project_listing_rejects_partial_pages_and_invalid_pagination() {
+    for damage in [
+        "null_connection",
+        "missing_count",
+        "missing_nodes",
+        "missing_page_info",
+        "missing_cursor",
+        "truncated",
+        "excess",
+        "changing_count",
+        "no_cursor",
+        "blank_cursor",
+        "repeated_cursor",
+        "empty_page",
+        "duplicate_item",
+    ] {
+        let f = Fixture::new();
+        for number in 1..=3 {
+            f.add_issue(spec(number));
+        }
+        let mut pages = project_pages(&f.0.borrow(), 1);
+        match damage {
+            "null_connection" => pages[0] = Value::Null,
+            "missing_count" => {
+                pages[0].as_object_mut().unwrap().remove("totalCount");
+            }
+            "missing_nodes" => {
+                pages[0].as_object_mut().unwrap().remove("nodes");
+            }
+            "missing_page_info" => {
+                pages[0].as_object_mut().unwrap().remove("pageInfo");
+            }
+            "missing_cursor" => {
+                pages[0]["pageInfo"].as_object_mut().unwrap().remove("endCursor");
+            }
+            "truncated" => pages[0]["pageInfo"]["hasNextPage"] = json!(false),
+            "excess" => pages[0]["totalCount"] = json!(0),
+            "changing_count" => pages[1]["totalCount"] = json!(4),
+            "no_cursor" => pages[0]["pageInfo"]["endCursor"] = Value::Null,
+            "blank_cursor" => pages[0]["pageInfo"]["endCursor"] = json!(" "),
+            "repeated_cursor" => pages[1]["pageInfo"]["endCursor"] = json!("cursor-1"),
+            "empty_page" => pages[0]["nodes"] = json!([]),
+            _ => pages[1]["nodes"][0]["id"] = pages[0]["nodes"][0]["id"].clone(),
+        }
+        f.state().project_pages = Some(pages);
+        assert!(f.github().project_issues().is_err(), "{damage}");
+    }
+}
+
+#[test]
+fn project_listing_rejects_redaction_malformed_items_and_inconsistent_issue_identities() {
+    for damage in [
+        "null_item",
+        "blank_item_id",
+        "missing_archived",
+        "null_archived",
+        "redacted",
+        "unknown_type",
+        "missing_content",
+        "null_content",
+        "unknown_content_type",
+        "mismatched_content_type",
+        "missing_issue_id",
+        "blank_issue_id",
+        "wrong_number",
+        "zero_number",
+        "pr_url",
+        "wrong_repo",
+        "missing_repository",
+        "foreign_inconsistent_issue",
+        "duplicate_issue",
+        "duplicate_issue_id",
+    ] {
+        let f = Fixture::new();
+        f.add_issue(spec(1));
+        f.add_issue(spec(2));
+        let mut pages = project_pages(&f.0.borrow(), 1);
+        let item = &mut pages[0]["nodes"][0];
+        match damage {
+            "null_item" => *item = Value::Null,
+            "blank_item_id" => item["id"] = json!(" "),
+            "missing_archived" => {
+                item.as_object_mut().unwrap().remove("isArchived");
+            }
+            "null_archived" => item["isArchived"] = Value::Null,
+            "redacted" => {
+                item["type"] = json!("REDACTED");
+                item["content"] = Value::Null;
+            }
+            "unknown_type" => item["type"] = json!("UNKNOWN"),
+            "missing_content" => {
+                item.as_object_mut().unwrap().remove("content");
+            }
+            "null_content" => item["content"] = Value::Null,
+            "unknown_content_type" => item["content"]["__typename"] = json!("Unknown"),
+            "mismatched_content_type" => item["type"] = json!("PULL_REQUEST"),
+            "missing_issue_id" => {
+                item["content"].as_object_mut().unwrap().remove("id");
+            }
+            "blank_issue_id" => item["content"]["id"] = json!(" "),
+            "wrong_number" => item["content"]["number"] = json!(99),
+            "zero_number" => item["content"]["number"] = json!(0),
+            "pr_url" => item["content"]["url"] = json!("https://github.com/acme/app/pull/1"),
+            "wrong_repo" => item["content"]["repository"]["nameWithOwner"] = json!("outside/repo"),
+            "missing_repository" => item["content"]["repository"] = Value::Null,
+            "foreign_inconsistent_issue" => item["content"]["url"] = json!("https://github.com/outside/repo/issues/1"),
+            "duplicate_issue" => {
+                let content = item["content"].clone();
+                pages[1]["nodes"][0]["content"] = content;
+                pages[1]["nodes"][0]["content"]["id"] = json!("I_duplicate_reference");
+            }
+            _ => {
+                let id = item["content"]["id"].clone();
+                pages[1]["nodes"][0]["content"]["id"] = id;
+            }
+        }
+        f.state().project_pages = Some(pages);
+        assert!(f.github().project_issues().is_err(), "{damage}");
+    }
+}
+
+#[test]
+fn project_listing_checks_hydrated_identity_against_enumeration() {
+    for damage in ["missing_alias", "changed_id", "wrong_number"] {
+        let f = Fixture::new();
+        f.add_issue(spec(1));
+        let pages = project_pages(&f.0.borrow(), 100);
+        f.state().project_pages = Some(pages);
+        match damage {
+            "missing_alias" => {
+                f.state().issues.remove(&(REPO.into(), 1));
+            }
+            "changed_id" => f.state().issues.get_mut(&(REPO.into(), 1)).unwrap()["id"] = json!("I_changed"),
+            _ => f.state().issues.get_mut(&(REPO.into(), 1)).unwrap()["number"] = json!(2),
+        }
+        assert!(f.github().project_issues().is_err(), "{damage}");
+    }
 }
 
 #[test]
@@ -958,8 +1177,9 @@ fn project_issue_listing_and_historical_prs_fail_closed() {
     assert!(f.github().project_issues().is_err());
     let f = Fixture::new();
     f.add_issue(spec(1));
-    f.state().queue_pages = json!([[rest_issue(1, REPO, OWNER)], [rest_issue(1, REPO, OWNER)]]);
-    fails(f.github().project_issues(), "duplicate issue");
+    let item = project_pages(&f.0.borrow(), 100)[0]["nodes"][0].clone();
+    f.state().project_pages = Some(connection_pages(vec![item.clone(), item], 1));
+    fails(f.github().project_issues(), "duplicate connection node");
     f.state().branch_prs = None;
     fails(f.github().pull_requests("worker/gh-1"), "pull requests");
 }
@@ -1079,7 +1299,6 @@ fn snapshot_batches_six_thousand_unrelated_issues_and_one_hundred_project_tasks(
     let f = Fixture::new();
     let history = 6000;
     let tasks = 100;
-    let mut candidates = Vec::new();
     for number in 1..=history + tasks {
         f.add_issue(Spec {
             project: (number > history).then_some(PROJECT),
@@ -1087,25 +1306,28 @@ fn snapshot_batches_six_thousand_unrelated_issues_and_one_hundred_project_tasks(
             reason: json!("COMPLETED"),
             ..spec(number)
         });
-        candidates.push(rest_issue(number, REPO, OWNER));
     }
-    f.state().queue_pages = json!(candidates.chunks(100).collect::<Vec<_>>());
+    // Any repository-wide REST enumeration would fail instead of loading unrelated history.
+    f.state().queue_pages = Value::Null;
     let snapshot = github_orchestrator::workstreams::snapshot(&dashboard_config(), &f.github(), &NoBranches).unwrap();
     assert_eq!(snapshot.tasks.len(), tasks as usize);
     let calls = f.calls();
     let graphql: Vec<_> = calls.iter().filter(|call| call.get(4).is_some_and(|arg| arg == "graphql")).collect();
     let membership: Vec<_> =
-        graphql.iter().filter(|call| call.iter().any(|arg| arg.contains("projectItems("))).collect();
-    assert_eq!(membership.len(), 122); // ceil((6000 + 100) / 50), never one request per historical issue.
-    assert_eq!(graphql.len(), 128); // 122 membership + 2 hydration + 2 labels + 2 branch PR batches.
-    assert!(membership.iter().all(|call| {
-        let query = call.iter().find(|arg| arg.starts_with("query=")).unwrap();
-        query.matches("includeArchived: true").count() == 50
-    }));
+        graphql.iter().filter(|call| call.iter().any(|arg| arg.contains("node(id: $project)"))).collect();
+    assert_eq!(membership.len(), 1); // One Project page, independent of unrelated repository history.
+    assert_eq!(graphql.len(), 7); // 1 enumeration + 2 hydration + 2 labels + 2 branch PR batches.
+    let query = membership[0].iter().find(|arg| arg.starts_with("query=")).unwrap();
+    assert!(query.contains("archivedStates: [ARCHIVED, NOT_ARCHIVED]"));
+    for excluded in ["body", "title", "assignees(", "projectItems(", "pullRequests(", "closedByPullRequestsReferences("]
+    {
+        assert!(!query.contains(excluded), "{query}");
+    }
+    assert!(!calls.iter().flatten().any(|arg| arg.contains("issues?state=") || arg.contains("projectItems(")));
     let dependencies =
         calls.iter().filter(|call| call.iter().any(|arg| arg.contains("dependencies/blocked_by?"))).count();
     assert_eq!(dependencies, tasks as usize);
-    assert_eq!(calls.len(), 231); // GraphQL + dependencies + label list + issue list + Project lookup.
+    assert_eq!(calls.len(), 109); // GraphQL + dependencies + label list + Project lookup.
 }
 
 #[test]
@@ -1114,9 +1336,6 @@ fn batched_snapshot_continues_each_overflow_connection_from_its_first_page() {
     f.add_issue(spec(1));
     f.state().queue_pages = json!([[rest_issue(1, REPO, OWNER)]]);
     f.state().label_pages = json!([[{"name": "gho:workstream:last-page"}]]);
-    let projects = (0..=100).map(|index| json!({
-        "id": format!("PVTI_{index}"), "project": {"id": if index == 100 { PROJECT.into() } else { format!("PVT_{index}") }}
-    })).collect();
     let assignees =
         (0..=100).map(|index| json!({"id": format!("U_{index}"), "login": format!("user-{index}")})).collect();
     let closing = (1000..=1100).map(|number| pr_node(number, "MERGED", REPO)).collect();
@@ -1125,12 +1344,9 @@ fn batched_snapshot_continues_each_overflow_connection_from_its_first_page() {
     })).collect();
     {
         let mut state = f.state();
-        for (field, nodes) in [
-            ("projectItems", projects),
-            ("assignees", assignees),
-            ("closedByPullRequestsReferences", closing),
-            ("labels", labels),
-        ] {
+        for (field, nodes) in
+            [("assignees", assignees), ("closedByPullRequestsReferences", closing), ("labels", labels)]
+        {
             state.connections.insert((REPO.into(), 1, field), connection_pages(nodes, 100));
         }
         let prs = (2000..=2100)
@@ -1143,11 +1359,11 @@ fn batched_snapshot_continues_each_overflow_connection_from_its_first_page() {
         state.branch_prs = Some(HashMap::from([("worker/gh-1".into(), connection_pages(prs, 100))]));
     }
     let snapshot = github_orchestrator::workstreams::snapshot(&dashboard_config(), &f.github(), &NoBranches).unwrap();
-    assert_eq!(snapshot.tasks.len(), 1); // Project membership exists only on the second page.
+    assert_eq!(snapshot.tasks.len(), 1);
     assert_eq!(snapshot.tasks[0].workstreams, ["last-page"]);
     assert_eq!(snapshot.tasks[0].pull_requests.len(), 202);
     let calls = f.calls();
-    assert_eq!(calls.iter().filter(|call| call.contains(&"cursor=cursor-1".into())).count(), 5);
+    assert_eq!(calls.iter().filter(|call| call.contains(&"cursor=cursor-1".into())).count(), 4);
     // The first pages came from batch aliases, so no cursor-less single-issue reads are repeated.
     assert!(
         calls
@@ -1159,7 +1375,7 @@ fn batched_snapshot_continues_each_overflow_connection_from_its_first_page() {
 
 #[test]
 fn batched_snapshot_rejects_partial_connections_and_wrong_alias_identities() {
-    for field in ["projectItems", "assignees", "closedByPullRequestsReferences", "labels", "branch"] {
+    for field in ["assignees", "closedByPullRequestsReferences", "labels", "branch"] {
         for damage in ["null", "truncated", "missing_count"] {
             let f = Fixture::new();
             f.add_issue(spec(1));
@@ -1200,7 +1416,7 @@ fn batched_snapshot_rejects_partial_connections_and_wrong_alias_identities() {
 
 #[test]
 fn snapshot_never_turns_partial_api_failure_into_empty_tasks() {
-    for operation in ["labels?", "issues?", "pullRequests(", "dependencies/blocked_by?"] {
+    for operation in ["labels?", "node(id: $project)", "pullRequests(", "dependencies/blocked_by?"] {
         let f = Fixture::new();
         f.add_issue(spec(1));
         f.state().queue_pages = json!([[rest_issue(1, REPO, OWNER)]]);
