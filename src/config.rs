@@ -1,4 +1,6 @@
-//! One queue per config file: which GitHub issues are yours, and which checkout gets the worktrees.
+//! Two config files in one directory: `config.toml` for settings shared by every repository (your login,
+//! agent models, the vault), and `repos/OWNER/REPO.toml` for each repository's queue (Project, base branch).
+//! The repository and checkout are not configured: they come from the git checkout gho runs in.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -17,19 +19,50 @@ static BRANCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za
 /// A Pi `--model` pattern such as `anthropic/claude-opus-4-5:high`: one word, no shell metacharacters.
 static MODEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$").unwrap());
 
-/// `$GHO_CONFIG`, or `~/.config/github-orchestrator/config.toml`.
-pub fn default_config_path() -> PathBuf {
-    let path = std::env::var_os("GHO_CONFIG").unwrap_or_else(|| "~/.config/github-orchestrator/config.toml".into());
+const GLOBAL_TEMPLATE: &str = include_str!("templates/global.toml");
+const REPO_TEMPLATE: &str = include_str!("templates/repo.toml");
+
+/// `$GHO_CONFIG_DIR`, or `~/.config/github-orchestrator`.
+pub fn default_config_dir() -> PathBuf {
+    let path = std::env::var_os("GHO_CONFIG_DIR").unwrap_or_else(|| "~/.config/github-orchestrator".into());
     expand_user(Path::new(&path))
+}
+
+/// The settings shared by every repository.
+pub fn global_path(dir: &Path) -> PathBuf {
+    dir.join("config.toml")
+}
+
+/// The settings of one repository (`OWNER/REPO`, lowercase).
+pub fn repo_path(dir: &Path, repo: &str) -> Result<PathBuf> {
+    validate_repo(repo)?;
+    Ok(dir.join("repos").join(format!("{}.toml", repo.to_lowercase())))
+}
+
+/// The global config file `gho init` writes, with the inferred login filled in.
+pub fn global_template(owner: &str) -> Result<String> {
+    ensure!(OWNER.is_match(owner), "owner must be a GitHub login, not {owner:?}.");
+    Ok(GLOBAL_TEMPLATE.replace("{owner}", owner))
+}
+
+/// The repository config file `gho init` writes. `project_url` is left for the user to fill in.
+pub fn repo_template(repo: &str, base_branch: &str) -> Result<String> {
+    validate_repo(repo)?;
+    ensure!(valid_branch(base_branch), "Invalid base branch {base_branch:?}.");
+    Ok(REPO_TEMPLATE.replace("{repo}", repo).replace("{base_branch}", base_branch))
+}
+
+fn valid_branch(branch: &str) -> bool {
+    BRANCH.is_match(branch) && !branch.contains("..")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Config {
+    /// From the checkout's origin.
     pub repo: String,
     pub owner: String,
-    pub project_id: String,
     pub project_url: String,
-    /// Absolute and symlink-free.
+    /// The checkout gho runs in. Absolute and symlink-free.
     pub checkout: PathBuf,
     pub base_branch: String,
     /// Absolute and symlink-free.
@@ -47,44 +80,48 @@ pub struct Agents {
     pub reviewer_model: Option<String>,
 }
 
-impl Agents {
-    fn is_empty(&self) -> bool {
-        self.implementer_model.is_none() && self.reviewer_model.is_none()
-    }
-}
+// The file layouts. Unknown keys are rejected so a typo cannot be silently ignored.
 
-/// The file layout. Unknown keys are rejected so a typo cannot be silently ignored.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct File {
-    queue: Queue,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    obsidian: Option<Obsidian>,
-    #[serde(default, skip_serializing_if = "Agents::is_empty")]
-    agents: Agents,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Queue {
-    repo: String,
+struct GlobalFile {
     owner: String,
-    project_id: String,
-    project_url: String,
-    checkout: PathBuf,
-    #[serde(default = "main")]
-    base_branch: String,
+    #[serde(default)]
+    agents: Agents,
+    #[serde(default)]
+    obsidian: Option<Obsidian>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Obsidian {
     #[serde(default)]
     vault: Option<PathBuf>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoFile {
+    project_url: String,
+    #[serde(default = "main")]
+    base_branch: String,
+}
+
 fn main() -> String {
     "main".into()
+}
+
+/// Parse one config file; errors name the file.
+fn read<T: serde::de::DeserializeOwned>(path: &Path, missing: &str) -> Result<T> {
+    let text = std::fs::read_to_string(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => Error::msg(format!("Config not found: {}. {missing}", path.display())),
+        _ => Error::msg(format!("Cannot read config {}: {error}", path.display())),
+    })?;
+    toml::from_str(&text).map_err(|error| invalid(path, error.message()))
+}
+
+fn invalid(path: &Path, detail: impl std::fmt::Display) -> Error {
+    Error::msg(format!("Invalid config {}: {detail}", path.display()))
 }
 
 impl Config {
@@ -93,68 +130,33 @@ impl Config {
         format!("{}/gh-{number}", self.owner)
     }
 
-    pub fn validate(&self) -> Result<()> {
-        validate_repo(&self.repo)?;
-        ensure!(OWNER.is_match(&self.owner), "owner must be a GitHub login.");
-        ensure!(
-            self.project_id.starts_with("PVT_"),
-            "project_id must be a GitHub Projects v2 ID (PVT_…). Run gho init."
-        );
-        ensure!(
-            PROJECT_URL.is_match(&self.project_url),
-            "project_url must be a github.com user or organization Project URL."
-        );
-        ensure!(BRANCH.is_match(&self.base_branch) && !self.base_branch.contains(".."), "Invalid base branch.");
+    /// Load the global config and `repo`'s config from `dir`, for the checkout at `checkout`.
+    pub fn load(dir: &Path, repo: &str, checkout: &Path) -> Result<Config> {
+        let global_path = global_path(dir);
+        let repo_path = repo_path(dir, repo)?;
+        let global: GlobalFile = read(&global_path, "Run gho init.")?;
+        let local: RepoFile = read(&repo_path, &format!("Run gho init in a checkout of {repo}."))?;
+        let check = |ok: bool, path: &Path, detail: &str| if ok { Ok(()) } else { Err(invalid(path, detail)) };
+        check(OWNER.is_match(&global.owner), &global_path, "owner must be a GitHub login.")?;
         for (key, model) in
-            [("implementer_model", &self.agents.implementer_model), ("reviewer_model", &self.agents.reviewer_model)]
+            [("implementer_model", &global.agents.implementer_model), ("reviewer_model", &global.agents.reviewer_model)]
         {
-            if let Some(model) = model {
-                ensure!(MODEL.is_match(model), "agents.{key} must be a Pi model pattern such as provider/model-id.");
-            }
+            let detail = format!("agents.{key} must be a Pi model pattern such as provider/model-id.");
+            check(model.as_ref().is_none_or(|m| MODEL.is_match(m)), &global_path, &detail)?;
         }
-        Ok(())
-    }
-
-    pub fn load(path: &Path) -> Result<Config> {
-        let text = std::fs::read_to_string(path).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => {
-                Error::msg(format!("Config not found: {}. Start with gho init --help.", path.display()))
-            }
-            _ => Error::msg(format!("Cannot read config {}: {error}", path.display())),
-        })?;
-        let invalid = |detail: String| Error::msg(format!("Invalid config {}: {detail}", path.display()));
-        let file: File = toml::from_str(&text).map_err(|error| invalid(error.message().to_string()))?;
-        let queue = file.queue;
-        let vault = file.obsidian.and_then(|o| o.vault).filter(|v| !v.as_os_str().is_empty());
-        let config = Config {
-            repo: queue.repo,
-            owner: queue.owner,
-            project_id: queue.project_id,
-            project_url: queue.project_url,
-            checkout: resolve(&queue.checkout)?,
-            base_branch: queue.base_branch,
+        check(!local.project_url.is_empty(), &repo_path, "fill in project_url.")?;
+        let detail = "project_url must be a github.com user or organization Project URL.";
+        check(PROJECT_URL.is_match(&local.project_url), &repo_path, detail)?;
+        check(valid_branch(&local.base_branch), &repo_path, "invalid base_branch.")?;
+        let vault = global.obsidian.and_then(|o| o.vault).filter(|v| !v.as_os_str().is_empty());
+        Ok(Config {
+            repo: repo.to_lowercase(),
+            owner: global.owner,
+            project_url: local.project_url,
+            checkout: resolve(checkout)?,
+            base_branch: local.base_branch,
             vault: vault.map(|v| resolve(&v)).transpose()?,
-            agents: file.agents,
-        };
-        config.validate().map_err(|error| invalid(error.to_string()))?;
-        Ok(config)
-    }
-
-    /// The config file text. GitHub remains the task store; credentials never belong here.
-    pub fn to_toml(&self) -> Result<String> {
-        let file = File {
-            queue: Queue {
-                repo: self.repo.clone(),
-                owner: self.owner.clone(),
-                project_id: self.project_id.clone(),
-                project_url: self.project_url.clone(),
-                checkout: self.checkout.clone(),
-                base_branch: self.base_branch.clone(),
-            },
-            obsidian: self.vault.clone().map(|vault| Obsidian { vault: Some(vault) }),
-            agents: self.agents.clone(),
-        };
-        let body = toml::to_string(&file).map_err(|error| Error::msg(format!("Cannot write config: {error}")))?;
-        Ok(format!("# GitHub remains the task store; no credentials belong in this file.\n{body}"))
+            agents: global.agents,
+        })
     }
 }

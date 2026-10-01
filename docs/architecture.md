@@ -32,11 +32,11 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 | Module | Responsibility |
 | --- | --- |
 | `src/cli.rs` | Commands, argument parsing (clap), output. `src/main.rs` only calls it. |
-| `src/config.rs` | Queue config (`[queue]`, optional `[obsidian]` and `[agents]`) and the branch naming rule. Unknown keys are rejected. |
+| `src/config.rs`, `src/templates/` | The two config files and the branch naming rule: `config.toml` (owner, optional `[agents]` and `[obsidian]`) and `repos/OWNER/REPO.toml` (`project_url`, `base_branch`). Unknown keys are rejected. `gho init` writes the templates with inferred values. |
 | `src/domain.rs` | Value types: `IssueRef`, `Issue`, `PullRequest`, and the state enums. |
-| `src/github.rs` | GitHub reads (queue, issue, blockers, linked PRs) and issue creation, through `gh`. Responses are decoded into strict types, so missing or partial API data is an error instead of looking like an empty queue. |
+| `src/github.rs` | Looks up the Project ID from the configured Project URL once per run. GitHub reads (queue, issue, blockers, linked PRs) and issue creation, through `gh`. Responses are decoded into strict types, so missing or partial API data is an error instead of looking like an empty queue. |
 | `src/work.rs` | `survey()` (the queue) and `classify()` (one issue): the `State` of each issue and its blockers: `blocked`, `ready { stack_on }`, `in_progress`, `ready_for_review`, `done` or `closed`. The `Issues` and `Branches` traits let tests replace GitHub and git. |
-| `src/workspace.rs` | Git and Worktrunk: fetch the base, list worktrees, create the issue's worktree. |
+| `src/workspace.rs` | Git and Worktrunk: find the checkout and its GitHub repository from the working directory, fetch the base, list worktrees, create the issue's worktree. |
 | `src/process.rs` | Subprocesses as argument arrays with timeouts. The `Runner` trait lets tests replace `gh`. |
 | `src/notes.rs`, `obsidian-plugin/` | Optional TaskNotes bridge: note-to-issue links and completion request/receipt files. |
 | `agent-context/` | All model-facing text: the orchestrator skill (`SKILL.md`) and the implementer and reviewer instructions it appends to their system prompts (`implementer.md`, `reviewer.md`). |
@@ -45,6 +45,8 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 ## Decisions
 
 - **No lifecycle management in code.** Launching, monitoring and retrying implementers is left to the orchestrator agent, so it can handle edge cases and choose how to run each implementer. The `[agents]` models are only stored and printed by `gho`; the orchestrator passes them to Pi.
+- **Config files are the only way to configure.** `gho init` takes no options. It creates missing config files with what it can infer (your login from `gh`, the base branch from `origin/HEAD`), and the user edits them. Settings shared by every repository are global; each repository's Project and base branch are in its own file, kept with the global one instead of in the repository because they are personal. The files hold only values a person can read and write: the Project is set by URL, and `gho` looks up its ID when it needs it.
+- **The working directory selects the repository.** The checkout and repository are never configured: `gho` uses the git checkout it runs in and the GitHub repository of its `origin`, so one installation serves every repository.
 - **No local state.** "In progress" means the issue's branch exists; "ready for review" means an open PR comes from it. Deleting the branch (`wt remove -D`) makes an issue without a PR ready again.
 - **Only ready work starts.** An issue is ready when every blocker is done or ready for review. Blockers under review must form one chain of PRs, and the new branch starts from the top of it (`origin/<branch>`), so stacks build on pushed work that others can see. `gho worktree N` refuses other issues; `--base` is the explicit override.
 - **PRs are found by branch.** GitHub ignores closing keywords on PRs that target a non-default branch, so a stacked PR is never linked to its issue. `gho` looks up open PRs by head branch `<owner>/gh-N` in the configured repository instead.

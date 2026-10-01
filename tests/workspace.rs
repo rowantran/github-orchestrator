@@ -55,7 +55,6 @@ fn repository() -> Repository {
     let config = Config {
         repo: "example/mono".into(),
         owner: "rowantran".into(),
-        project_id: "PVT_example".into(),
         project_url: "https://github.com/users/rowantran/projects/1".into(),
         checkout,
         base_branch: "main".into(),

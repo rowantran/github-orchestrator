@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 const REPO: &str = "acme/app";
 const PROJECT: &str = "PVT_queue";
+const PROJECT_URL: &str = "https://github.com/orgs/acme/projects/7";
 const OWNER: &str = "worker";
 const BRANCH: &str = "work/issue-1";
 
@@ -102,7 +103,7 @@ impl Fixture {
             dependencies: HashMap::new(),
             branch_prs: Some(HashMap::new()),
             queue_pages: json!([[]]),
-            project: json!({"id": PROJECT, "url": "https://github.com/orgs/acme/projects/7", "title": "Queue"}),
+            project: json!({"id": PROJECT, "url": PROJECT_URL, "title": "Queue"}),
             before: Box::new(|_| None),
             graphql_errors: vec![],
             raw_output: None,
@@ -118,7 +119,7 @@ impl Fixture {
     }
 
     fn github(&self) -> GitHub<'_> {
-        GitHub::new(REPO, PROJECT, OWNER, self).unwrap()
+        GitHub::new(REPO, PROJECT_URL, OWNER, self).unwrap()
     }
 
     fn add_issue(&self, spec: Spec) -> IssueRef {
@@ -155,9 +156,7 @@ impl Fixture {
             if endpoint == "graphql" {
                 let params: HashMap<&str, &str> = args[4..].iter().filter_map(|a| a.split_once('=')).collect();
                 let query = params["query"];
-                let data = if query.contains("node(id:") {
-                    json!({"node": state.project})
-                } else if query.contains("issue(number:") {
+                let data = if query.contains("issue(number:") {
                     let repo = format!("{}/{}", params["owner"], params["name"]).to_lowercase();
                     let number: u64 = params["number"].parse().unwrap();
                     let mut issue = state.issues.get(&(repo.clone(), number)).cloned().unwrap_or(Value::Null);
@@ -526,6 +525,19 @@ fn resolve_project_rejects_other_hosts_and_invalid_urls() {
         assert!(f.github().resolve_project(url).is_err(), "{url}");
         assert!(f.calls().is_empty());
     }
+}
+
+#[test]
+fn configured_project_is_looked_up_once_and_must_be_a_project_url() {
+    let f = Fixture::new();
+    f.add_issue(spec(1));
+    f.state().queue_pages = json!([[rest_issue(1, REPO, OWNER)]]);
+    let github = f.github();
+    assert_eq!(github.queue().unwrap().len(), 1);
+    github.issue(&issue_ref(REPO, 1)).unwrap();
+    let views = f.calls().iter().filter(|call| call[1..3] == ["project", "view"]).count();
+    assert_eq!(views, 1);
+    assert!(GitHub::new(REPO, "https://github.com/acme/app", OWNER, &f).is_err());
 }
 
 #[test]

@@ -21,29 +21,41 @@ cargo install --locked --git https://github.com/rowantran/github-orchestrator
 pi install git:github.com/rowantran/github-orchestrator
 
 gh auth refresh -s project
-gho init --checkout /absolute/path/to/isara --project https://github.com/users/rowantran/projects/123
+cd /path/to/your/clone
+gho init      # creates the config files below if they are missing
+$EDITOR ~/.config/github-orchestrator/repos/OWNER/REPO.toml   # set project_url
 gho doctor
 ```
 
-`--repo` defaults to the checkout's GitHub `origin` and `--owner` to the authenticated user. `--base` sets the default base branch (`main`). Add `--vault /path/to/vault` to use the optional Obsidian bridge.
+You configure `gho` by editing two files. `gho init` takes no options. It creates whichever file is missing, fills in what it can infer, and never overwrites a file:
 
-`--implementer-model` and `--reviewer-model` set the Pi models (`--model` patterns such as `anthropic/claude-opus-4-5:high`) that the orchestrator launches agents with, instead of your Pi default. You can also set them later in the config:
+- `~/.config/github-orchestrator/config.toml`: settings shared by every repository. `gho init` fills in `owner` with your GitHub login (from `gh`).
 
-```toml
-[agents]
-implementer_model = "anthropic/claude-opus-4-5:high"
-reviewer_model = "openai/gpt-5"
-```
+  ```toml
+  owner = "rowantran"                                   # your queue is the issues assigned to you; branches are <owner>/gh-N
+  [agents]                                              # optional Pi --model patterns; unset means your Pi default
+  implementer_model = "anthropic/claude-opus-4-5:high"
+  reviewer_model = "openai/gpt-5"
+  [obsidian]                                            # optional TaskNotes bridge
+  vault = "/path/to/vault"
+  ```
 
-`gho config` prints the loaded config as JSON; `gho doctor` warns when a model is not set.
+- `~/.config/github-orchestrator/repos/OWNER/REPO.toml`: settings for one repository. `gho init` creates it when you run it in a clone of that repository, and fills in `base_branch` from `origin/HEAD` (else `main`). You fill in `project_url`.
 
-The config is written to `~/.config/github-orchestrator/config.toml`. Override it with `GHO_CONFIG` or `gho --config PATH`. Worktrees go wherever your Worktrunk configuration puts them.
+  ```toml
+  project_url = "https://github.com/users/rowantran/projects/123"
+  base_branch = "main"
+  ```
+
+The repository and checkout are not configured: `gho` uses the git checkout you run it in (any worktree or subdirectory of it) and the GitHub repository of its `origin`. Unknown keys are an error. `gho doctor` checks that you can read the Project and warns when an agent model is not set. `gho config` prints the loaded config as JSON.
+
+Use another config directory with `GHO_CONFIG_DIR` or `gho --config-dir PATH`. Worktrees go wherever your Worktrunk configuration puts them.
 
 To update later: rerun the `cargo install` command and `pi update`.
 
 ## Use it through the orchestrator
 
-Start Pi as usual. It lists the `github-orchestrator` skill and loads it when you ask to plan or run queue work; `/skill:github-orchestrator` forces it. The commands the skill uses:
+Start Pi in your clone. It lists the `github-orchestrator` skill and loads it when you ask to plan or run queue work; `/skill:github-orchestrator` forces it. The commands the skill uses:
 
 ```sh
 gho task create --title "One bounded change" --body-file task.md --blocked-by 41

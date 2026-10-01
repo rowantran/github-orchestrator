@@ -111,7 +111,6 @@ fn config() -> Config {
     Config {
         repo: REPO.into(),
         owner: "owner".into(),
-        project_id: "PVT_q".into(),
         project_url: "https://github.com/users/owner/projects/1".into(),
         checkout: PathBuf::from("/nonexistent"),
         base_branch: "main".into(),

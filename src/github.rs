@@ -3,6 +3,7 @@
 //! Responses are decoded into strict types: missing, null, blank or unexpected data is an error,
 //! so an inaccessible Project or a truncated page never looks like an empty queue.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Display;
 use std::num::NonZeroU64;
@@ -289,17 +290,25 @@ enum Var<'a> {
 
 pub struct GitHub<'a> {
     repo: String,
-    project_id: String,
+    project_url: String,
+    /// Looked up from `project_url` on first use.
+    project: OnceCell<Project>,
     owner: String,
     runner: &'a dyn Runner,
 }
 
 impl<'a> GitHub<'a> {
-    /// `project_id` may be empty while resolving the initial configuration.
-    pub fn new(repo: &str, project_id: &str, owner: &str, runner: &'a dyn Runner) -> Result<Self> {
+    pub fn new(repo: &str, project_url: &str, owner: &str, runner: &'a dyn Runner) -> Result<Self> {
         validate_repo(repo)?;
         check!(LOGIN.is_match(owner), "owner login");
-        Ok(GitHub { repo: repo.into(), project_id: project_id.into(), owner: owner.into(), runner })
+        project_path(project_url)?;
+        Ok(GitHub {
+            repo: repo.into(),
+            project_url: project_url.into(),
+            project: OnceCell::new(),
+            owner: owner.into(),
+            runner,
+        })
     }
 
     fn run<S: AsRef<str>>(&self, args: &[S]) -> Result<String> {
@@ -353,18 +362,16 @@ impl<'a> GitHub<'a> {
         Ok(items)
     }
 
-    fn project(&self) -> Result<Project> {
-        check!(!self.project_id.trim().is_empty(), "explicit project ID is required");
-        let query = "query($id: ID!) { node(id: $id) { ... on ProjectV2 { id url title } } }";
-        let mut data = self.graphql(query, &[("id", Var::Str(&self.project_id))])?;
-        let node = data.get_mut("node").map(Value::take).unwrap_or_default();
-        let project: Project = parse(node, "project (check project access and gh scopes)")?;
-        check!(project.id == self.project_id, "project ID");
-        project_path(&project.url)?;
-        Ok(project)
+    /// The configured Project, looked up once. Fails when the Project is inaccessible.
+    fn project(&self) -> Result<&Project> {
+        if let Some(project) = self.project.get() {
+            return Ok(project);
+        }
+        let project = self.resolve_project(&self.project_url)?;
+        Ok(self.project.get_or_init(|| project))
     }
 
-    /// Look up a Project by its URL, for `gho init`.
+    /// Look up a Project by its URL.
     pub fn resolve_project(&self, url: &str) -> Result<Project> {
         let wanted = project_path(url)?;
         let value = self.json(&["project", "view", &wanted.number, "--owner", &wanted.owner, "--format", "json"])?;
@@ -447,7 +454,7 @@ impl<'a> GitHub<'a> {
             // The REST search can lag; confirm state, assignment and Project membership live.
             let issue = self.issue(&reference)?;
             if issue.state == IssueState::Open
-                && issue.project_ids.contains(&self.project_id)
+                && issue.project_ids.contains(&self.project()?.id)
                 && issue.assignees.iter().any(|a| a.eq_ignore_ascii_case(&self.owner))
             {
                 result.push(issue);
@@ -466,7 +473,8 @@ impl<'a> GitHub<'a> {
         let items: Vec<ProjectItem> =
             self.issue_connection(reference, "projectItems", "id project { id }", ", includeArchived: true")?;
         let project_ids: Vec<String> = items.into_iter().map(|item| item.project.id).collect();
-        check!(project_ids.iter().filter(|id| **id == self.project_id).count() <= 1, "duplicate project membership");
+        let project_id = &self.project()?.id;
+        check!(project_ids.iter().filter(|id| *id == project_id).count() <= 1, "duplicate project membership");
         let closing: Vec<PullRequestNode> =
             self.issue_connection(reference, "closedByPullRequestsReferences", PR_FIELDS, ", includeClosedPrs: true")?;
         let endpoint =
@@ -579,7 +587,7 @@ impl<'a> GitHub<'a> {
             ])?;
             parse::<Identified>(item, "created project item")?;
             let issue = self.issue(&reference)?;
-            check!(issue.project_ids.contains(&self.project_id), "created issue project membership");
+            check!(issue.project_ids.contains(&self.project()?.id), "created issue project membership");
             check!(issue.assignees.iter().any(|a| a.eq_ignore_ascii_case(&self.owner)), "created issue assignee");
             check!(blockers.iter().all(|blocker| issue.blockers.contains(blocker)), "created issue dependencies");
             Ok(issue)

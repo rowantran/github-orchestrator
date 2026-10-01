@@ -8,30 +8,31 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use crate::config::{Agents, Config, default_config_path};
+use crate::config::{Config, default_config_dir, global_path, global_template, repo_path, repo_template};
 use crate::domain::{IssueRef, StateReason};
 use crate::github::GitHub;
 use crate::notes::{Notes, Status, note_path};
 use crate::paths::{expand_user, resolve};
 use crate::process::{Cmd, Runner, System, which};
 use crate::work::{Blocker, Entry, Issues, State, classify, survey};
-use crate::workspace::{Workspace, github_remote_repo};
+use crate::workspace::{Workspace, locate, origin_default_branch};
 use crate::{Error, Result, bail, ensure};
 
 #[derive(Debug, Parser)]
 #[command(name = "gho", version, about = "Your GitHub issue queue → ready work → Worktrunk worktrees.")]
 pub struct Cli {
-    /// Queue configuration TOML [default: $GHO_CONFIG, or ~/.config/github-orchestrator/config.toml]
+    /// Directory of config.toml and repos/OWNER/REPO.toml [default: $GHO_CONFIG_DIR, or
+    /// ~/.config/github-orchestrator]
     #[arg(long, global = true)]
-    pub config: Option<PathBuf>,
+    pub config_dir: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Write a queue config; never creates a Project
-    Init(InitArgs),
+    /// Create the global config and this checkout's repository config, if missing; never overwrites
+    Init,
     /// Check git, gh, wt and GitHub Project access
     Doctor,
     /// Print the loaded config, including the agent models, as JSON
@@ -59,34 +60,6 @@ pub enum Command {
     /// Optional TaskNotes bridge
     #[command(subcommand)]
     Notes(NotesCommand),
-}
-
-#[derive(Debug, clap::Args)]
-pub struct InitArgs {
-    /// Repository checkout that gets the worktrees [default: current directory]
-    #[arg(long)]
-    pub checkout: Option<PathBuf>,
-    /// OWNER/REPO [default: the checkout's origin]
-    #[arg(long)]
-    pub repo: Option<String>,
-    /// GitHub login [default: the authenticated user]
-    #[arg(long)]
-    pub owner: Option<String>,
-    /// GitHub Project URL
-    #[arg(long)]
-    pub project: String,
-    /// Default base branch for new worktrees
-    #[arg(long, default_value = "main")]
-    pub base: String,
-    /// Optional Obsidian vault for the TaskNotes bridge
-    #[arg(long)]
-    pub vault: Option<PathBuf>,
-    /// Pi model pattern for implementer agents, e.g. anthropic/claude-opus-4-5:high
-    #[arg(long)]
-    pub implementer_model: Option<String>,
-    /// Pi model pattern for reviewer agents
-    #[arg(long)]
-    pub reviewer_model: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -144,19 +117,20 @@ pub fn main(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> i32 
 }
 
 pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
-    let config_path = cli.config.map_or_else(default_config_path, |path| expand_user(&path));
+    let config_dir = cli.config_dir.map_or_else(default_config_dir, |path| expand_user(&path));
+    let cwd = std::env::current_dir()?;
     let command = match cli.command {
-        Command::Init(args) => return init(&config_path, args, runner, out),
+        Command::Init => return init(&config_dir, &cwd, runner, out),
         command => command,
     };
-    let config = Config::load(&config_path)?;
+    let config = load(&config_dir, &cwd, runner)?;
     if let Command::Config = command {
         return print_json(out, &config);
     }
-    let github = GitHub::new(&config.repo, &config.project_id, &config.owner, runner)?;
+    let github = GitHub::new(&config.repo, &config.project_url, &config.owner, runner)?;
     let workspace = Workspace::new(&config, runner);
     match command {
-        Command::Init(_) | Command::Config => unreachable!("handled above"),
+        Command::Init | Command::Config => unreachable!("handled above"),
         Command::Doctor => doctor(&config, &github, &workspace, out),
         Command::Ready { all, json } => display_ready(&survey(&config, &github, &workspace)?, all, json, out),
         Command::Worktree { issue, base } => {
@@ -240,50 +214,58 @@ fn ask_terminal(message: &str, yes: bool) -> Result<()> {
     })
 }
 
-pub fn init(config_path: &Path, args: InitArgs, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
-    let path = resolve(config_path)?;
-    ensure!(!path.exists(), "Config already exists: {}. Edit it directly or choose --config.", path.display());
-    let checkout = resolve(&args.checkout.unwrap_or_else(|| PathBuf::from(".")))?;
-    let remote = runner.run(&Cmd::new(["git", "remote", "get-url", "origin"]).cwd(&checkout))?;
-    let remote = github_remote_repo(remote.trim());
-    let repo = match (args.repo, &remote) {
-        (Some(repo), Some(remote)) if repo.to_lowercase() == *remote => repo,
-        (None, Some(remote)) => remote.clone(),
-        _ => bail!("Checkout origin must match a github.com repository (OWNER/REPO)."),
+/// The config for the checkout that contains `cwd`.
+pub fn load(config_dir: &Path, cwd: &Path, runner: &dyn Runner) -> Result<Config> {
+    let Some((checkout, repo)) = locate(cwd, runner)? else {
+        bail!("Run gho inside a checkout of a GitHub repository.");
     };
-    let owner = match args.owner {
-        Some(owner) => owner,
-        None => {
+    Config::load(&resolve(config_dir)?, &repo, &checkout)
+}
+
+/// Create whichever of the global config and the repository config of the checkout at `cwd` is missing,
+/// filled in with what can be inferred. Never overwrites a config.
+pub fn init(config_dir: &Path, cwd: &Path, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+    let config_dir = resolve(config_dir)?;
+    // Each config file, with its text and the inferred values when it is missing. Everything is inferred
+    // before anything is written, so a failure leaves no partial setup.
+    let mut files: Vec<(PathBuf, Option<(String, String)>)> = Vec::new();
+    let global = global_path(&config_dir);
+    let missing = (!global.exists())
+        .then(|| {
             let cmd = Cmd::new(["gh", "api", "--hostname", "github.com", "user", "--jq", ".login"])
                 .env("GH_HOST", "github.com");
-            runner.run(&cmd)?.trim().to_string()
-        }
-    };
-    let project = GitHub::new(&repo, "", &owner, runner)?.resolve_project(&args.project)?;
-    let config = Config {
-        repo,
-        owner,
-        project_id: project.id,
-        project_url: project.url,
-        checkout,
-        base_branch: args.base,
-        vault: args.vault.map(|vault| resolve(&vault)).transpose()?,
-        agents: Agents { implementer_model: args.implementer_model, reviewer_model: args.reviewer_model },
-    };
-    config.validate()?;
-    let text = config.to_toml()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+            let owner = runner.run(&cmd)?.trim().to_string();
+            Ok::<_, Error>((global_template(&owner)?, format!("owner {owner}")))
+        })
+        .transpose()?;
+    files.push((global, missing));
+    let checkout = locate(cwd, runner)?;
+    if let Some((checkout, repo)) = &checkout {
+        let path = repo_path(&config_dir, repo)?;
+        let missing = (!path.exists())
+            .then(|| {
+                let base = origin_default_branch(checkout, runner).unwrap_or_else(|| "main".into());
+                Ok::<_, Error>((repo_template(repo, &base)?, format!("{repo}, base branch {base}")))
+            })
+            .transpose()?;
+        files.push((path, missing));
     }
-    fs::OpenOptions::new().write(true).create_new(true).open(&path)?.write_all(text.as_bytes())?;
-    writeln!(
-        out,
-        "Configured {} for {}: {}\nBoard: {}\nNext: gho doctor",
-        config.repo,
-        config.owner,
-        path.display(),
-        config.project_url
-    )?;
+    for (path, missing) in &files {
+        let Some((text, inferred)) = missing else {
+            writeln!(out, "Exists, unchanged: {}", path.display())?;
+            continue;
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::OpenOptions::new().write(true).create_new(true).open(path)?.write_all(text.as_bytes())?;
+        writeln!(out, "Created {} ({inferred})", path.display())?;
+    }
+    match files.get(1) {
+        Some((path, Some(_))) => writeln!(out, "Next: set project_url in {}, then run gho doctor.", path.display())?,
+        Some((_, None)) => writeln!(out, "Next: gho doctor")?,
+        None => writeln!(out, "Not in a git checkout. Run gho init in a checkout to configure its repository.")?,
+    }
     Ok(())
 }
 
