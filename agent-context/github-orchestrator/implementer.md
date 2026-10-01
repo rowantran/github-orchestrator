@@ -51,7 +51,7 @@ When a comment asks for a change, change the skeleton, commit, push, and reply w
 
 ## Phase 3: Implement
 
-Replace the skeleton with the real implementation. Keep to the approved skeleton. If you must deviate from it in a way that changes a type, a contract, or the behavior, stop and ask the user first in a comment on the pull request, and wait for the answer.
+Replace the skeleton with the real implementation. Keep to the approved skeleton.
 
 Run the verification commands from the issue and fix any failures. Commit your work on this branch.
 
