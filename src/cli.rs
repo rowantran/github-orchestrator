@@ -8,14 +8,14 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use crate::config::{Agents, Config, default_config_path};
+use crate::config::{Config, TEMPLATE, default_config_path};
 use crate::domain::{IssueRef, StateReason};
 use crate::github::GitHub;
 use crate::notes::{Notes, Status, note_path};
 use crate::paths::{expand_user, resolve};
-use crate::process::{Cmd, Runner, System, which};
+use crate::process::{Runner, System, which};
 use crate::work::{Blocker, Entry, Issues, State, classify, survey};
-use crate::workspace::{Workspace, github_remote_repo};
+use crate::workspace::Workspace;
 use crate::{Error, Result, bail, ensure};
 
 #[derive(Debug, Parser)]
@@ -30,8 +30,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Write a queue config; never creates a Project
-    Init(InitArgs),
+    /// Write a config file template to fill in; never overwrites
+    Init,
     /// Check git, gh, wt and GitHub Project access
     Doctor,
     /// Print the loaded config, including the agent models, as JSON
@@ -59,34 +59,6 @@ pub enum Command {
     /// Optional TaskNotes bridge
     #[command(subcommand)]
     Notes(NotesCommand),
-}
-
-#[derive(Debug, clap::Args)]
-pub struct InitArgs {
-    /// Repository checkout that gets the worktrees [default: current directory]
-    #[arg(long)]
-    pub checkout: Option<PathBuf>,
-    /// OWNER/REPO [default: the checkout's origin]
-    #[arg(long)]
-    pub repo: Option<String>,
-    /// GitHub login [default: the authenticated user]
-    #[arg(long)]
-    pub owner: Option<String>,
-    /// GitHub Project URL
-    #[arg(long)]
-    pub project: String,
-    /// Default base branch for new worktrees
-    #[arg(long, default_value = "main")]
-    pub base: String,
-    /// Optional Obsidian vault for the TaskNotes bridge
-    #[arg(long)]
-    pub vault: Option<PathBuf>,
-    /// Pi model pattern for implementer agents, e.g. anthropic/claude-opus-4-5:high
-    #[arg(long)]
-    pub implementer_model: Option<String>,
-    /// Pi model pattern for reviewer agents
-    #[arg(long)]
-    pub reviewer_model: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -146,17 +118,17 @@ pub fn main(args: impl IntoIterator<Item = impl Into<OsString> + Clone>) -> i32 
 pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
     let config_path = cli.config.map_or_else(default_config_path, |path| expand_user(&path));
     let command = match cli.command {
-        Command::Init(args) => return init(&config_path, args, runner, out),
+        Command::Init => return init(&config_path, out),
         command => command,
     };
     let config = Config::load(&config_path)?;
     if let Command::Config = command {
         return print_json(out, &config);
     }
-    let github = GitHub::new(&config.repo, &config.project_id, &config.owner, runner)?;
+    let github = GitHub::new(&config.repo, &config.project_url, &config.owner, runner)?;
     let workspace = Workspace::new(&config, runner);
     match command {
-        Command::Init(_) | Command::Config => unreachable!("handled above"),
+        Command::Init | Command::Config => unreachable!("handled above"),
         Command::Doctor => doctor(&config, &github, &workspace, out),
         Command::Ready { all, json } => display_ready(&survey(&config, &github, &workspace)?, all, json, out),
         Command::Worktree { issue, base } => {
@@ -240,50 +212,15 @@ fn ask_terminal(message: &str, yes: bool) -> Result<()> {
     })
 }
 
-pub fn init(config_path: &Path, args: InitArgs, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
+/// Write the config template to `config_path` for the user to edit. Never overwrites a config.
+pub fn init(config_path: &Path, out: &mut dyn Write) -> Result<()> {
     let path = resolve(config_path)?;
-    ensure!(!path.exists(), "Config already exists: {}. Edit it directly or choose --config.", path.display());
-    let checkout = resolve(&args.checkout.unwrap_or_else(|| PathBuf::from(".")))?;
-    let remote = runner.run(&Cmd::new(["git", "remote", "get-url", "origin"]).cwd(&checkout))?;
-    let remote = github_remote_repo(remote.trim());
-    let repo = match (args.repo, &remote) {
-        (Some(repo), Some(remote)) if repo.to_lowercase() == *remote => repo,
-        (None, Some(remote)) => remote.clone(),
-        _ => bail!("Checkout origin must match a github.com repository (OWNER/REPO)."),
-    };
-    let owner = match args.owner {
-        Some(owner) => owner,
-        None => {
-            let cmd = Cmd::new(["gh", "api", "--hostname", "github.com", "user", "--jq", ".login"])
-                .env("GH_HOST", "github.com");
-            runner.run(&cmd)?.trim().to_string()
-        }
-    };
-    let project = GitHub::new(&repo, "", &owner, runner)?.resolve_project(&args.project)?;
-    let config = Config {
-        repo,
-        owner,
-        project_id: project.id,
-        project_url: project.url,
-        checkout,
-        base_branch: args.base,
-        vault: args.vault.map(|vault| resolve(&vault)).transpose()?,
-        agents: Agents { implementer_model: args.implementer_model, reviewer_model: args.reviewer_model },
-    };
-    config.validate()?;
-    let text = config.to_toml()?;
+    ensure!(!path.exists(), "Config already exists: {}. Edit it directly.", path.display());
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::OpenOptions::new().write(true).create_new(true).open(&path)?.write_all(text.as_bytes())?;
-    writeln!(
-        out,
-        "Configured {} for {}: {}\nBoard: {}\nNext: gho doctor",
-        config.repo,
-        config.owner,
-        path.display(),
-        config.project_url
-    )?;
+    fs::OpenOptions::new().write(true).create_new(true).open(&path)?.write_all(TEMPLATE.as_bytes())?;
+    writeln!(out, "Wrote {}.\nNext: fill in its [queue] values, then run gho doctor.", path.display())?;
     Ok(())
 }
 

@@ -1,15 +1,13 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use clap::Parser;
-use github_orchestrator::cli::{self, Cli, InitArgs};
-use github_orchestrator::config::Config;
+use github_orchestrator::cli::{self, Cli};
+use github_orchestrator::config::{Config, TEMPLATE};
 use github_orchestrator::domain::{Issue, IssueRef, IssueState, PullRequest, PullRequestState, StateReason};
 use github_orchestrator::notes::Notes;
-use github_orchestrator::process::{Cmd, Runner};
 use github_orchestrator::work::{Blocker, Entry, Issues, LinkedPullRequest, State};
 use github_orchestrator::{Error, Result};
 use serde_json::json;
@@ -17,72 +15,63 @@ use tempfile::TempDir;
 
 const PROJECT: &str = "https://github.com/users/Owner/projects/1";
 
-/// Answers the three commands `gho init` runs.
-struct InitRunner {
-    checkout: PathBuf,
-    calls: RefCell<Vec<Vec<String>>>,
-}
-
-impl Runner for InitRunner {
-    fn run(&self, cmd: &Cmd) -> Result<String> {
-        self.calls.borrow_mut().push(cmd.argv.clone());
-        let argv: Vec<&str> = cmd.argv.iter().map(String::as_str).collect();
-        match argv.as_slice() {
-            ["git", "remote", "get-url", "origin"] => {
-                assert_eq!(cmd.cwd.as_deref(), Some(self.checkout.as_path()));
-                Ok("git@github.com:Acme/App.git\n".into())
-            }
-            ["gh", "api", "--hostname", "github.com", "user", "--jq", ".login"] => Ok("Owner\n".into()),
-            ["gh", "project", "view", "1", "--owner", "Owner", "--format", "json"] => {
-                Ok(json!({"id": "PVT_queue", "url": PROJECT, "title": "Queue"}).to_string())
-            }
-            _ => panic!("Unexpected command: {argv:?}"),
-        }
-    }
-}
-
 struct Initialized {
     dir: TempDir,
     config: PathBuf,
-    runner: InitRunner,
 }
 
 impl Initialized {
     fn root(&self) -> PathBuf {
         self.dir.path().canonicalize().unwrap()
     }
-
-    fn args(&self) -> InitArgs {
-        InitArgs {
-            checkout: Some(self.root().join("source")),
-            repo: None,
-            owner: None,
-            project: PROJECT.into(),
-            base: "main".into(),
-            vault: Some(self.root().join("vault")),
-            implementer_model: Some("anthropic/claude-opus-4-5:high".into()),
-            reviewer_model: None,
-        }
-    }
 }
 
+/// `gho init`, then fill in the template the way a user would.
 fn initialized() -> Initialized {
     let dir = TempDir::new().unwrap();
     let root = dir.path().canonicalize().unwrap();
     fs::create_dir(root.join("source")).unwrap();
-    let runner = InitRunner { checkout: root.join("source"), calls: RefCell::new(vec![]) };
-    let state = Initialized { config: root.join("config/gho.toml"), dir, runner };
+    let state = Initialized { config: root.join("config/gho.toml"), dir };
     let mut out = Vec::new();
-    cli::init(&state.config, state.args(), &state.runner, &mut out).unwrap();
-    assert!(String::from_utf8(out).unwrap().contains("Next: gho doctor"));
+    cli::init(&state.config, &mut out).unwrap();
+    assert!(String::from_utf8(out).unwrap().contains("then run gho doctor"));
+    let source = root.join("source");
+    let filled = fs::read_to_string(&state.config)
+        .unwrap()
+        .replace("repo = \"\"", "repo = \"acme/app\"")
+        .replace("owner = \"\"", "owner = \"Owner\"")
+        .replace("project_url = \"\"", &format!("project_url = \"{PROJECT}\""))
+        .replace("checkout = \"\"", &format!("checkout = \"{}\"", source.display()))
+        .replace(
+            "# [obsidian]\n# vault = \"~/Obsidian/Vault\"",
+            &format!("[obsidian]\nvault = \"{}\"", root.join("vault").display()),
+        )
+        .replace("# implementer_model", "implementer_model");
+    fs::write(&state.config, filled).unwrap();
     state
 }
 
 #[test]
-fn init_round_trip_and_no_overwrite() {
+fn init_writes_the_template_and_never_overwrites() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("nested/gho.toml");
+    let output = run_binary(&["--config", path.to_str().unwrap(), "init"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read_to_string(&path).unwrap(), TEMPLATE);
+    let error = Config::load(&path).unwrap_err().to_string();
+    assert!(error.ends_with("fill in queue.repo, queue.owner, queue.project_url, queue.checkout."), "{error}");
+    fs::write(&path, "edited").unwrap();
+    let error = cli::init(&path, &mut Vec::new()).unwrap_err();
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "edited");
+}
+
+#[test]
+fn filled_in_template_loads() {
     let state = initialized();
     let config = Config::load(&state.config).unwrap();
     assert_eq!((config.repo.as_str(), config.owner.as_str()), ("acme/app", "Owner"));
+    assert_eq!(config.project_url, PROJECT);
     assert_eq!(config.checkout, state.root().join("source"));
     assert_eq!(config.base_branch, "main");
     assert_eq!(config.vault, Some(state.root().join("vault")));
@@ -90,11 +79,6 @@ fn init_round_trip_and_no_overwrite() {
     assert_eq!(config.branch(42), "Owner/gh-42");
     assert_eq!(config.agents.implementer_model.as_deref(), Some("anthropic/claude-opus-4-5:high"));
     assert_eq!(config.agents.reviewer_model, None);
-    let before = fs::read(&state.config).unwrap();
-    let error = cli::init(&state.config, state.args(), &state.runner, &mut Vec::new()).unwrap_err();
-    assert!(error.to_string().contains("already exists"));
-    assert_eq!(fs::read(&state.config).unwrap(), before);
-    assert_eq!(state.runner.calls.borrow().len(), 3);
 }
 
 fn run_binary(args: &[&str]) -> std::process::Output {
@@ -105,7 +89,8 @@ fn run_binary(args: &[&str]) -> std::process::Output {
 fn invalid_config_has_actionable_error() {
     let cases = [
         ("[queue]", "[queue"),
-        ("project_id = \"PVT_queue\"", "project_id = 7"),
+        (PROJECT, "https://github.com/acme/app"),
+        ("repo = \"acme/app\"", "repo = \"acme/app\"\nproject_id = \"PVT_queue\""),
         ("base_branch = \"main\"", "base_branch = \"../x\""),
         ("base_branch = \"main\"", "base_branch = \"main\"\nbase-branch = \"typo\""),
         ("implementer_model = \"anthropic/claude-opus-4-5:high\"", "implementer_model = \"opus; rm -rf /\""),
@@ -144,24 +129,14 @@ fn missing_config_points_to_init() {
     let dir = TempDir::new().unwrap();
     let output = run_binary(&["--config", dir.path().join("none.toml").to_str().unwrap(), "ready"]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8(output.stderr).unwrap().contains("gho init --help"));
-}
-
-#[test]
-fn init_rejects_repo_mismatch_before_creating_config() {
-    let state = initialized();
-    let other = state.config.with_file_name("other.toml");
-    let args = InitArgs { repo: Some("other/repo".into()), ..state.args() };
-    let error = cli::init(&other, args, &state.runner, &mut Vec::new()).unwrap_err();
-    assert!(error.to_string().contains("origin must match"));
-    assert!(!other.exists());
+    assert!(String::from_utf8(output.stderr).unwrap().contains("Create it with gho init."));
 }
 
 #[test]
 fn parser_rejects_incomplete_or_removed_commands() {
     for argv in [
         &["worktree"][..],
-        &["init"],
+        &["init", "--project", "https://github.com/users/Owner/projects/1"],
         &["notes", "link", "task.md"],
         &["approve", "1"],
         &["task", "create", "--title", "x"],

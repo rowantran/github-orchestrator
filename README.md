@@ -21,23 +21,32 @@ cargo install --locked --git https://github.com/rowantran/github-orchestrator
 pi install git:github.com/rowantran/github-orchestrator
 
 gh auth refresh -s project
-gho init --checkout /absolute/path/to/isara --project https://github.com/users/rowantran/projects/123
+gho init     # writes a config template to ~/.config/github-orchestrator/config.toml
+$EDITOR ~/.config/github-orchestrator/config.toml
 gho doctor
 ```
 
-`--repo` defaults to the checkout's GitHub `origin` and `--owner` to the authenticated user. `--base` sets the default base branch (`main`). Add `--vault /path/to/vault` to use the optional Obsidian bridge.
-
-`--implementer-model` and `--reviewer-model` set the Pi models (`--model` patterns such as `anthropic/claude-opus-4-5:high`) that the orchestrator launches agents with, instead of your Pi default. You can also set them later in the config:
+You configure `gho` by editing its config file. `gho init` takes no options: it writes a commented template and never overwrites an existing config. Fill in the `[queue]` values:
 
 ```toml
-[agents]
+[queue]
+repo = "rowantran/isara"                                      # OWNER/REPO
+owner = "rowantran"                                           # your GitHub login; branches are <owner>/gh-N
+project_url = "https://github.com/users/rowantran/projects/123"
+checkout = "/absolute/path/to/isara"                          # the clone that gets the worktrees
+base_branch = "main"                                          # optional; default "main"
+
+[obsidian]                                                    # optional TaskNotes bridge
+vault = "/path/to/vault"
+
+[agents]                                                      # optional Pi --model patterns
 implementer_model = "anthropic/claude-opus-4-5:high"
 reviewer_model = "openai/gpt-5"
 ```
 
-`gho config` prints the loaded config as JSON; `gho doctor` warns when a model is not set.
+The orchestrator launches implementer and reviewer agents with the `[agents]` models, or with your Pi default when a model is not set. Unknown keys are an error. `gho doctor` checks that the checkout's `origin` is `repo` and that you can read the Project, and warns when a model is not set. `gho config` prints the loaded config as JSON.
 
-The config is written to `~/.config/github-orchestrator/config.toml`. Override it with `GHO_CONFIG` or `gho --config PATH`. Worktrees go wherever your Worktrunk configuration puts them.
+The config path is `~/.config/github-orchestrator/config.toml`. Override it with `GHO_CONFIG` or `gho --config PATH` (for `gho init` too). Worktrees go wherever your Worktrunk configuration puts them.
 
 To update later: rerun the `cargo install` command and `pi update`.
 
