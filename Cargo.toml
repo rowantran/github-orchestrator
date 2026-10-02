@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Find ready GitHub issues and create Worktrunk worktrees for an orchestrator agent."
 publish = false
+repository = "https://github.com/rowantran/github-orchestrator"
 
 [[bin]]
 name = "gho"

@@ -20,7 +20,7 @@ use crate::process::{Cmd, Runner, System, which};
 use crate::wait::{Schedule, poll};
 use crate::work::{Blocker, Entry, Issues, State, classify, survey};
 use crate::workspace::{Created, Workspace, locate, origin_default_branch};
-use crate::{Error, Result, agents, bail, brief, dashboard, ensure, reviews, workstreams};
+use crate::{Error, Result, agents, bail, brief, dashboard, ensure, reviews, version, workstreams};
 
 #[derive(Debug, Parser)]
 #[command(name = "gho", version, about = "Your GitHub issue queue → ready work → Worktrunk worktrees.")]
@@ -211,6 +211,10 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
         Command::Init => return init(&config_dir, &cwd, runner, out),
         command => command,
     };
+    if let Command::Doctor = command {
+        // Before loading the config, so that a config error does not hide an outdated version.
+        writeln!(out, "{}", version::report(version::installed(), version::published(runner)))?;
+    }
     let config = load(&config_dir, &cwd, runner)?;
     if let Command::Config = command {
         return print_json(out, &config);
