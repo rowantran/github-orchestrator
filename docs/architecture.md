@@ -1,77 +1,97 @@
-<!-- Purpose: explain responsibilities and module layout. Audience: maintainers. Injection: documentation only; not loaded into agents. -->
+<!-- Purpose: explain implementation ownership and recovery boundaries. Audience: maintainers. Injection: documentation only. -->
 # Architecture
 
-`gho` gives an orchestrator agent a few deterministic operations. Everything that needs judgment stays with the agent and the user.
+The TypeScript service is the deterministic executor. The supervisor agent plans work and operates the CLI; it is not the scheduler. The CLI and dashboard are clients of the same service.
+
+## Responsibilities
+
+| Component | Owns |
+| --- | --- |
+| GitHub | Issue content, assignment, Project membership, dependencies, workstreams, PRs, CI, human feedback, and merge state. |
+| `orchestrator/core/` | GitHub CLI adapter, configuration, dependency classification, Worktrunk provisioning, workstreams, and TaskNotes bridge. |
+| `orchestrator/cli.ts` | User/supervisor commands, JSON output, service lifecycle, and task-management commands. |
+| `orchestrator/service.ts` | Independent service process, repository-scoped ownership, HTTP server, and runtime discovery. |
+| `orchestrator/engine.ts` | Lifecycle gates, ready-task dispatch, concurrency, retry limits, review/fix loops, approval, and reconciliation. |
+| `orchestrator/store.ts` | Private atomic execution checkpoints and bounded agent event reads. No local task database. |
+| `orchestrator/agents/` | Worker runtimes behind one shared interface. `types.ts` defines `WorkerAgent`, `AgentOptions` and `AgentFactory`; `index.ts` selects the runtime from `agents.runtime` and loads it lazily; `report.ts` validates and atomically publishes phase reports for both runtimes. The engine, service and CLI import only `agents/index.ts` and `agents/types.ts`. |
+| `orchestrator/agents/durable/` | Default runtime. `agent.ts`: one Pi Durable conversation per task role, stored in the worktree, with Pi-compatible events, steering, recovery of interrupted turns, and the `gho_report` tool. `pi-runtime.ts`: the operator's Pi configuration (models, credentials, extension-registered providers, settings, context files, skills, Pi's system prompt sections). |
+| `orchestrator/agents/rpc/` | Optional runtime (`agents.runtime = "rpc"`). `agent.ts`: one normal Pi CLI subprocess per active task role, stable session identity, JSONL protocol, event delivery, model configuration, dialogs, and process-group shutdown. `report-extension.ts`: the Pi extension that adds `gho_report` and the writer-lock guard, loaded explicitly into each RPC worker. |
+| `orchestrator/http.ts`, `dashboard/` | Dependency graph, lifecycle controls, transcript/tool inspection, nudges, and dialog responses. |
+| `orchestrator/tailscale.ts` | Explicit temporary tailnet sharing, without Funnel or persistent configuration changes. |
+| `agent-context/runtime/` | All worker/reviewer instructions, phase prompts, recovery instructions, and report-tool description. |
+| `agent-context/github-orchestrator/SKILL.md` | Supervisor instructions for operating the CLI. |
+
+The npm-installed `gho` executable and service are entirely TypeScript. The Pi package loads only the supervisor skill by default; the RPC runtime explicitly loads its compiled `report-extension.js` into each worker; durable workers define the same tool in-process. Neither runtime imports the other; a layout test enforces this. Agent status comes from worker events, not a separate status-file extension.
+
+## Task lifecycle
 
 ```text
-You ↔ orchestrator agent (Pi + the github-orchestrator skill)
-        │ gho task create      → GitHub issue + Project + blocked-by links
-        │ gho ready --json     → reads GitHub queue, open PRs by branch, local branches
-        │ gho worktree N       → git fetch + wt switch --create + .gho/brief.md
-        │ gho config           → agent models from the config
-        │ gho workstream …     → overlapping issue memberships, stored as GitHub labels
-        │ gho dashboard        → local graph + PR links + selection of existing tmux panes
-        │ gho wait agents      → blocks until an agent settles (reads .gho/agents/*.json)
-        ▼
-   implementer agents, one per worktree, each in a tmux window
-   (skeleton → draft PR → agreed with you in PR comments → implementation → PR published)
-        │ gho wait review      → blocks until a review is submitted on the agent's PR
-        │ Pi extension         → writes .gho/agents/NAME.json when started with --gho-agent=NAME
-        ▼
-   reviewer agent per PR → orchestrator relays findings → you review and merge
+queued → planning → awaiting_approval → implementing → reviewing → ready_to_merge
+                         │                   ↑             │
+                         │                   └── findings ─┘
+                         └─ automatic for unsupervised tasks
 ```
 
-## Who owns what
+Both modes require a pushed skeleton and draft PR. Planner and implementer use one saved Pi session; their model selections can differ. A phase boundary can close and reopen the worker without replacing its conversation. The reviewer uses a separate saved session. At most one role is active in a task's worktree.
 
-| Owner | Responsibility |
-| --- | --- |
-| GitHub | Tasks: title, body, assignee, Project membership, blockers, open/closed and close reason. Workstream definitions and many-to-many memberships are repository labels. |
-| Git checkout | Work in progress: branch `<owner>/gh-N` and its worktree. With an open draft PR, the issue is still in progress; once the PR is published (not a draft), it is ready for review. |
-| `gho` | Reads the two above to classify issues; creates issues and worktrees; manages workstream labels and serves a read-only task graph. Can select an existing tmux pane, never launch or control its agent. Waits, read-only, for agent statuses and pull request reviews. No local database. |
-| Pi extension | Records each launched agent's activity in its worktree's `.gho/agents/NAME.json`. |
-| Orchestrator agent | Which tasks to start, launching and managing implementers, retries, stacking, review, publishing. |
-| You | Plan approval, what to run, when to publish, merging. |
+`paused` and `blocked` preserve the phase to resume. `needs_input`, repeated agent failures, or exhausted review/CI correction budgets block execution. `done` and `closed` are terminal. Closing a task as not planned/duplicate does not make it successful or unblock dependent issues.
 
-## Modules
+The service publishes a PR only after a reviewer approves its current revision and CI is passed or absent. Pending checks wait; failures return to implementation within the fix budget. A report is not proof that a check passed: the service checks the branch/base, pushed head, clean worktree, GitHub check status, and reviewer revision. The worker and reviewer also run issue-specific verification.
 
-| Module | Responsibility |
-| --- | --- |
-| `src/cli.rs` | Commands, argument parsing (clap), output. `src/main.rs` only calls it. |
-| `src/config.rs`, `src/templates/` | The two config files and the branch naming rule: `config.toml` (owner, optional `[agents]` and `[obsidian]`) and `repos/OWNER/REPO.toml` (`project_url`, `base_branch`). Unknown keys are rejected. `gho init` writes the templates with inferred values. |
-| `src/domain.rs` | Value types: `IssueRef`, `Issue`, `PullRequest`, and the state enums. |
-| `src/github.rs` | Looks up the Project ID from the configured Project URL once per run. GitHub reads (queue, issues, blockers, labels, and PRs), issue creation, and workstream label mutations, through `gh`. Responses are decoded into strict types, so missing or partial API data is an error instead of looking like an empty queue. |
-| `src/work.rs` | `survey()` (the queue) and `classify()` (one issue): the `State` of each issue and its blockers: `blocked`, `ready { stack_on }`, `in_progress`, `ready_for_review`, `done` or `closed`. The `Issues` and `Branches` traits let tests replace GitHub and git. |
-| `src/workstreams.rs` | Workstream label validation and dashboard snapshots. Reads all repository/Project issues, including closed work and archived Project items, with all memberships and PR links. Membership comes directly from `ProjectV2.items(archivedStates: [ARCHIVED, NOT_ARCHIVED])`, not repository history. Task details, labels, and branch PRs are batched; overflowing connections retain strict pagination. Classification happens before display filtering. |
-| `src/dashboard.rs`, `dashboard/` | Loopback-only HTTP server and embedded static graph UI. The browser filters overlapping groups, renders internal dependency edges, and shows external blockers in task details. API requests require a per-process token; Host/Origin checks and a content security policy protect local data and pane selection. Bounded connection workers parse requests and serve assets independently of GitHub reads. Request size/deadline limits and a 90-second snapshot subprocess budget prevent indefinite waits. |
-| `src/tailscale.rs` | Optional tailnet HTTP sharing. Detects validated node names, refuses occupied Serve/Funnel ports, and owns a temporary foreground Tailscale Serve process targeting the loopback backend. Confirms startup and releases only its own foreground session on shutdown. |
-| `src/tmux.rs` | Discover existing live panes, associate them by repository/issue tags (or one exact worktree path), and revalidate before selecting a window/pane. Missing tmux is an optional-integration warning. |
-| `tests/dashboard_e2e/` | Playwright browser tests against the actual CLI in a temporary repository with fake GitHub responses. No real issues, PRs, or vaults. |
-| `src/workspace.rs` | Git and Worktrunk: find the checkout and its GitHub repository from the working directory, fetch the base, list worktrees, create the issue's worktree, find the branch its pull request targets. |
-| `src/brief.rs` | The task brief: fills in `agent-context/brief.md` (compiled in) and writes it to `.gho/brief.md` in the new worktree, next to a `.gitignore` that ignores `.gho/`. |
-| `src/wait.rs` | The polling loop of `gho wait`: interval, timeout, and retries of failed checks after a first success. |
-| `src/agents.rs`, `extensions/agent-status.mjs` | `gho wait agents`. The Pi extension writes one status file per agent (`starting`, `working`, `prompting`, `settled`, `exited`) with a 5-second heartbeat, replaced atomically. The Rust side reads them from issue worktrees, marks a status older than 60 seconds `lost`, and decides when the wait ends. The cursor maps each agent to the settling it last reported. |
-| `src/reviews.rs` | `gho wait review`. Reads a pull request, its reviews and its review comments over REST, ignores pending, dismissed and agent-written reviews, and returns new submitted reviews with their comments. The cursor is the last handled submission time with the IDs handled at that second. |
-| `src/version.rs`, `build.rs` | The version check of `gho doctor`. `build.rs` records the commit that `gho` is built from (`cargo install --git` builds in a Git checkout); `gho doctor` compares it with the tip of `main` in the repository from `Cargo.toml`, read with `git ls-remote`. Every commit is a new version. |
-| `src/process.rs` | Subprocesses as argument arrays with timeouts. The `Runner` trait lets tests replace `gh`. |
-| `src/notes.rs`, `obsidian-plugin/` | Optional TaskNotes bridge: note-to-issue links and completion request/receipt files. |
-| `agent-context/` | All model-facing text: the orchestrator skill (`SKILL.md`), the implementer and reviewer instructions it appends to their system prompts (`implementer.md`, `reviewer.md`), and the task brief template that `gho worktree` fills in (`brief.md`). |
-| `package.json` | Pi package manifest, so `pi install git:github.com/rowantran/github-orchestrator` installs the skill and the agent status extension. |
+Only humans merge. There is no merge operation in the core service interface.
 
-## Decisions
+## Approval and feedback
 
-- **No lifecycle management in code.** Launching, monitoring and retrying implementers is left to the orchestrator agent, so it can handle edge cases and choose how to run each implementer. The `[agents]` models are only stored and printed by `gho`; the orchestrator passes them to Pi.
-- **Config files are the only way to configure.** `gho init` takes no options. It creates missing config files with what it can infer (your login from `gh`, the base branch from `origin/HEAD`), and the user edits them. Settings shared by every repository are global; each repository's Project and base branch are in its own file, kept with the global one instead of in the repository because they are personal. The files hold only values a person can read and write: the Project is set by URL, and `gho` looks up its ID when it needs it.
-- **The working directory selects the repository.** The checkout and repository are never configured: `gho` uses the git checkout it runs in and the GitHub repository of its `origin`, so one installation serves every repository.
-- **No local state.** "In progress" means the issue's branch exists or a draft PR comes from it; "ready for review" means an open PR that is not a draft comes from it. Deleting the branch (`wt remove -D`) makes an issue without a PR ready again.
-- **Workstreams are overlapping sets, not issue parents.** Each `gho:workstream:NAME` label defines one group. A task can have any number of memberships; names containing slashes have no inherited membership. Labels preserve GitHub as the only task store. The dashboard's root is all issues in this repository's configured Project, not just the user's open queue.
-- **A filtered graph is not a new schedule.** Compute status on the full dependency graph, then filter only visible nodes and edges. External dependencies remain in task details. Completed work stays visible; closed-but-not-completed issues remain a distinct state.
-- **Pane focus is navigation, not lifecycle management.** The skill tags launched panes with repository and issue identities. The server only discovers and selects live panes and checks ownership again on every click. Nothing in Rust starts an agent or sends it input. The dashboard keeps only its current view in memory and never persists operational state.
-- **Tailnet sharing is explicit.** `dashboard --tailscale-serve` keeps the backend on loopback and manages only its own foreground Serve session. The HTTP port defaults to 8080. Exact node-name Host/Origin allowances come from Tailscale status, never forwarded headers or browser input. Tailnet access rules are the authorization boundary; the HTML session token prevents cross-site API calls but is not a user login. No Funnel, privilege escalation, or reset of existing Serve configuration.
-- **Only ready work starts.** An issue is ready when every blocker is done or ready for review. Blockers under review must form one chain of PRs, and the new branch starts from the top of it (`origin/<branch>`), so stacks build on pushed work that others can see. `gho worktree N` refuses other issues; `--base` is the explicit override.
-- **The brief is deterministic.** `gho worktree` writes each issue's task brief from a template, so every agent gets the same facts in the same form, and the orchestrator does not write briefs itself. The brief lives in the worktree, in a self-ignoring `.gho/` directory, so it needs no shared Git configuration and is removed with the worktree.
-- **Publishing a PR is the hand-off.** Implementers open a draft PR early, to review the skeleton on GitHub. A draft is unfinished work, so it does not count as ready for review and does not unblock dependents; marking the PR ready for review does. The workflow does not depend on agents remembering to ignore draft PRs.
-- **PRs are found by branch.** GitHub ignores closing keywords on PRs that target a non-default branch, so a stacked PR is never linked to its issue. `gho` looks up open PRs by head branch `<owner>/gh-N` in the configured repository instead.
-- **Waiting is deterministic and read-only.** Agents must not write their own polling loops or spend context on checks that find nothing. `gho wait` does the polling and returns one JSON result; agents run it as a background command. It never starts, stops, or sends input to an agent.
-- **Agent activity comes from Pi, not the terminal.** Reading tmux panes would depend on how Pi draws its screen. The extension reports Pi's own lifecycle events (`agent_start`, `agent_settled`, dialogs, quit) and a heartbeat, so a dead agent is detected too. It is inert unless the launch passes `--gho-agent=NAME`. Status files are runtime state of a running agent, kept in the worktree's ignored `.gho/` directory, not task state.
-- **A review is the unit of feedback.** `gho wait review` ends on a submitted review, so the implementer gets a whole batch of comments at once. Agents use the user's GitHub account, so their reviews are recognized by the `[agent:]` prefix. A cursor that the agent passes back, not local state, records which reviews were delivered. Without one, every review on the pull request counts, so a relaunched agent sees the whole history.
-- **Completed means `COMPLETED`.** Issues closed as not planned or duplicate never unblock dependents or complete notes.
+Approval binds to the full skeleton commit SHA. The CLI and dashboard submit explicit approval requests. GitHub uses an exact `/gho approve FULL_SHA` command from the configured owner in a PR comment or submitted review. Agent comments beginning with `[agent:]` cannot provide approval or human feedback.
+
+An updated skeleton invalidates the old gate. A nudge at the gate authorizes skeleton revision, not implementation. Revision-bound checks reject stale approval and review results. Feedback delivery identities are checkpointed to avoid repeated polling delivery.
+
+These gates are workflow controls for trusted agents, not a sandbox against malicious code running as the same OS/GitHub user. Normal Pi tool permissions still apply.
+
+## Persistence and recovery
+
+GitHub remains the task store. The service writes runtime artifacts under the repository's Git common directory:
+
+```text
+<git-common-dir>/gho-service/
+  service.guard                # permanent inode for OS-held flock; never unlink
+  service.lock                 # readable ownership metadata, not the authority
+  service.json                 # PID, loopback port, private token
+  service.log
+  executions/<issue>.json      # phase, mode, approval, session IDs, dispatch identity
+  events/<issue>-<role>.jsonl   # agent output and operator interactions
+```
+
+Each worktree contains ignored `.gho/sessions/` (durable `<session>.sqlite` files or Pi JSONL sessions) and `.gho/reports/`. Checkpoints are atomic replacements; reports are atomically published without replacing an existing conflicting result. Dispatch identity is stored before launching Pi. Provisioning intent is stored before creating a worktree, permitting recovery of an interrupted owned creation. A service restart processes saved reports before retrying an interrupted turn.
+
+Only one service may own the checkout's execution records and session writers. Ownership uses an OS-held `flock` on a permanent inode, not stale PID-file deletion. Each worker (a durable conversation in the service, or a Pi child process) separately holds a worktree-wide lock under `.gho/writer/` before it can accept a phase prompt. A service crash cannot release an old worker's lock while that worker is still alive. A normal CLI command can exit while the service continues. A process manager is required for automatic service restart; the service itself does not install one.
+
+Recovery is not arbitrary tool-call replay. Pi Durable stores each model request and tool call as a checkpointed task. Closing a durable worker (pause, service stop, crash) keeps its unfinished turn; the next start resumes it, retries a cut-off model request, and reports an interrupted non-replayable tool call to the model instead of rerunning it. The engine then sends no new phase prompt and steers pending operator messages into the resumed turn, except when implementation was not yet admitted. A run past its deadline is aborted before closing, so a retry does not resume it. `gho_report` is replay-safe because an identical report is idempotent and a conflicting one is rejected. Prompts carry a request ID derived from the dispatch and text, so a repeated delivery is admitted once. An interrupted RPC session resumes with instructions to inspect the working copy, commits, PRs, and external effects before repeating actions. Exactly-once external side effects are not promised. Do not open a service-owned session concurrently in a separate TUI process.
+
+## Normal Pi behavior
+
+Durable workers (default) run in the service process on `@earendil-works/pi-durable`. `PiDurableRuntime` calls Pi's `createAgentSessionServices` once per service: it loads `auth.json`, `models.json`, settings, and installed Pi extensions so that extension-registered providers join the model runtime. Extension tools, hooks, commands, and dialogs are not run. For each worktree a resource loader without extensions reads context files, skills, `SYSTEM.md`, and `APPEND_SYSTEM.md`, and Pi's `buildSystemPromptSections` renders them with the snippets and guidelines of Pi's built-in tools. These sections are untagged durable prompt sections; role instructions are the conversation's `instructions`, rendered last. The tools are Pi Durable's `read`, `bash`, `edit`, and `write`, which use the same schemas as Pi's tools, plus `gho_report`. `bash` receives the worker's own `PI_SESSION_ID`, `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL` instead of the launching session's. Pi exports neither the prompt builder nor its HTTP dispatcher setup, so `agents/durable/pi-runtime.ts` loads those two modules from the exact pinned `@earendil-works/pi-coding-agent` version.
+
+The durable driver translates Pi Durable agent events into the coding-agent event names the engine and dashboard already use. It emits `agent_settled` only when the conversation is idle and every submission it made has settled.
+
+With `agents.runtime = "rpc"`, workers launch the actual `pi --mode rpc` executable, with an explicit worktree, session directory, and stable session ID. Pi loads its normal settings, providers, credentials, extensions, skills, and context files. The service supplies only its additional report extension and role instructions.
+
+The RPC driver uses LF-only JSONL framing, correlated command IDs, continuously drained output, bounded frames/queues, and command deadlines. `agent_settled`, not `agent_end`, indicates that Pi will not continue automatically. Prompt acceptance is not phase completion. Standard extension dialogs are forwarded and never silently approved. Terminal-specific custom UI is not available in RPC mode.
+
+## Dashboard safety
+
+The HTTP server binds to loopback. API calls require a per-process token, exact Host/Origin checks, bounded JSON bodies, and deadlines. Only fixed bundled assets are served. The browser receives neither GitHub credentials nor arbitrary RPC/command execution access. Agent text is rendered as text, not HTML.
+
+The task graph retains full Project membership, overlapping workstreams, archived/completed tasks, and external blocker details. Display filters never recalculate readiness. Transcript/lifecycle polling reads local execution state without triggering graph refreshes.
+
+Tailscale sharing is explicit. It validates exact node names, refuses occupied Serve/Funnel ports, owns a temporary foreground mapping, and removes only that mapping at shutdown. Tailnet rules authorize access to the dashboard and its mutation controls.
+
+## Verification
+
+- Core tests use command fakes and temporary git repositories/vaults.
+- Lifecycle tests cover gate enforcement, model/session continuity, review/CI loops, recovery, concurrency, and pause/resume.
+- Durable tests use Pi's faux provider for tool turns, steering, abort, writer locks, model continuity, and recovery after closing mid-tool. An integration test runs the HTTP → engine → durable workflow with real Git commits and a service restart in the middle of a tool call. A runtime test loads a temporary Pi agent directory with an extension-registered provider and streams one response from a local OpenAI-compatible fake.
+- RPC tests use fake subprocesses for framing, failure, backpressure, dialogs, and cleanup. An installed-Pi smoke test verifies normal resource discovery without a model request.
+- HTTP tests cover routing, token/Host/Origin validation, limits, shutdown, and Tailscale ownership.
+- Playwright CLI tests exercise task selection, agent inspection, messages, explicit approval, dialogs, and failure recovery in the browser.
+- Regression coverage exercises the shipped TypeScript code, including the existing task-management behavior and dashboard graph/filter controls.

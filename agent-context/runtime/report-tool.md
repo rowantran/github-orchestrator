@@ -1,0 +1,6 @@
+<!-- Purpose: describe structured phase reports. Audience: service-owned Pi workers and reviewers. Injection: gho_report tool description. -->
+Report the result of your current authorized phase to the orchestration service, then stop working. This does not grant approval or move the workflow by itself; the service validates your report against the PR and revision.
+
+Use kind=skeleton_ready only after committing and pushing the pseudocode/stub skeleton and opening its draft PR. Use kind=implementation_ready only after implementing the approved skeleton, running verification, committing, and pushing; keep the PR a draft. Use kind=review_passed only after reviewing the exact requested revision and finding no blocking problems. Use kind=changes_requested when review found concrete problems, with an actionable findings array. Use kind=needs_input when you cannot safely continue; explain the specific question or blocker.
+
+The summary must identify the commit and PR when available, explain what you verified, and list verification commands with their results. Never claim a check passed unless you ran it or inspected its result. A phase report is immutable: make it only when you are done with the phase, then stop. Do not approve your own skeleton, publish or merge a PR, or close the issue.

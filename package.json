@@ -1,14 +1,54 @@
 {
   "name": "github-orchestrator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Pi package: the github-orchestrator skill for working through a GitHub issue queue with gho, and the agent status extension that gho wait agents reads.",
-  "keywords": ["pi-package"],
+  "type": "module",
+  "description": "GitHub task orchestration with persistent Pi sessions, human approval gates, and a local dashboard.",
+  "keywords": [
+    "pi-package"
+  ],
+  "bin": {
+    "gho": "bin/gho.mjs"
+  },
+  "files": [
+    "bin/",
+    "dist/orchestrator/",
+    "agent-context/",
+    "dashboard/app.js",
+    "dashboard/index.html",
+    "dashboard/style.css",
+    "obsidian-plugin/manifest.json",
+    "obsidian-plugin/main.js",
+    "docs/architecture.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "test": "node --test extensions/tests/*.test.mjs"
+    "build": "node build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/tests/*.test.js",
+    "test:browser": "npm run build && playwright test --config tests/orchestration-browser/playwright.config.ts",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "^1.0.0",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
+    "commander": "^14.0.0",
+    "smol-toml": "^1.4.2",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.1",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
   },
   "pi": {
-    "skills": ["./agent-context/github-orchestrator"],
-    "extensions": ["./extensions/agent-status.mjs"]
+    "skills": [
+      "./agent-context/github-orchestrator"
+    ],
+    "extensions": []
   }
 }

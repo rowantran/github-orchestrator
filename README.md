@@ -1,183 +1,211 @@
 # GitHub Orchestrator
 
-`gho` is a small CLI that an orchestrator agent uses to work through your GitHub issue queue. Its core operations are:
+`gho` turns GitHub issues into persistent Pi work sessions. Talk to a supervisor agent, which operates the CLI; an independent orchestration service handles scheduling, worktrees, agents, reviews, and the dashboard.
 
-1. **Register work:** create GitHub issues assigned to you, added to your Project, with native "blocked by" links.
-2. **Find ready work:** list open issues in your queue that you can start: every blocker is done, or has an open pull request to stack on.
-3. **Create a worktree:** make branch `<owner>/gh-N` for a ready issue in a new Worktrunk worktree, from the latest base branch or stacked on its blockers' pull requests. The worktree gets a task brief for the issue's agents in `.gho/brief.md`, which Git ignores.
-4. **Wait:** block until agents settle (`gho wait agents`) or until someone submits a review on a pull request (`gho wait review`). Agents run these in the background, so they need no polling logic of their own and use no context while nothing happens.
+```text
+You ↔ supervisor agent → gho CLI → orchestration service
+                                       ├─ GitHub tasks and dependency graph
+                                       ├─ Worktrunk worktrees
+                                       ├─ Pi planner/implementer + reviewer
+                                       └─ dashboard ↔ you
+```
 
-You can also group tasks into overlapping workstreams and view their dependencies in a local dashboard. The dashboard opens PR links and selects existing agent panes in tmux; it does not launch or manage agents.
-
-The agent you talk to handles the implementation workflow. It launches an implementer agent in each worktree, in its own tmux window. The implementer first commits a skeleton (pseudocode and stubs at the real paths) and opens a draft PR with it. You review the skeleton in PR comments, and the implementer answers there, with every comment prefixed `[agent:]`. When you approve, it implements the change, pushes it to the same PR, and marks the PR ready for review. Then the orchestrator launches a reviewer agent on it. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells the orchestrator how; `implementer.md` and `reviewer.md` next to it are the other agents' standing instructions. This repository is a Pi package that ships them, and a Pi extension that records each agent's activity for `gho wait agents`.
-
-GitHub is the only task store. `gho` keeps no local state: a task is "in progress" when its branch exists or it has a draft pull request, and "ready for review" when an open pull request that is not a draft comes from that branch.
+Closing the supervisor's session does not stop enrolled tasks. The service never merges a PR.
 
 ## Install and configure
 
-You need Rust (`cargo`), Git, an authenticated GitHub CLI (`gh` 2.94 or later, for `--blocked-by`) with Projects scope, Worktrunk (`wt`), and Pi.
+Requirements: Linux or macOS, Node.js 24+, Git, an authenticated GitHub CLI (`gh` 2.94+ for native issue dependencies), Worktrunk (`wt`), and a configured Pi installation (`~/.pi/agent`). The Pi CLI on `PATH` is needed only for `agents.runtime = "rpc"`. The service also needs `flock` for OS-held locks (included in Linux util-linux; on macOS: `brew install flock`).
 
 ```sh
-# The gho CLI
-cargo install --locked --git https://github.com/rowantran/github-orchestrator
-# The orchestrator skill, as a Pi package
-pi install git:github.com/rowantran/github-orchestrator
+npm ci
+npm link                         # installs this checkout's TypeScript gho CLI
+pi install /absolute/path/to/github-orchestrator
 
 gh auth refresh -s project
-cd /path/to/your/clone
-gho init      # creates the config files below if they are missing
-$EDITOR ~/.config/github-orchestrator/repos/OWNER/REPO.toml   # set project_url
+cd /path/to/your/repository
+gho init
 gho doctor
 ```
 
-You configure `gho` by editing two files. `gho init` takes no options. It creates whichever file is missing, fills in what it can infer, and never overwrites a file:
+`gho init` creates missing configuration files without overwriting existing files. Fill in your Project URL before using other commands. `gho doctor` checks prerequisites and compares the CLI's build commit with the published `main` commit. An unknown, different, or unavailable version produces a warning, not a failure.
 
-- `~/.config/github-orchestrator/config.toml`: settings shared by every repository. `gho init` fills in `owner` with your GitHub login (from `gh`).
+`~/.config/github-orchestrator/config.toml`:
 
-  ```toml
-  owner = "rowantran"                                   # your queue is the issues assigned to you; branches are <owner>/gh-N
-  [agents]                                              # optional Pi --model patterns; unset means your Pi default
-  implementer_model = "anthropic/claude-opus-4-5:high"
-  reviewer_model = "openai/gpt-5"
-  [obsidian]                                            # optional TaskNotes bridge
-  vault = "/path/to/vault"
-  ```
+```toml
+owner = "your-github-login"
 
-- `~/.config/github-orchestrator/repos/OWNER/REPO.toml`: settings for one repository. `gho init` creates it when you run it in a clone of that repository, and fills in `base_branch` from `origin/HEAD` (else `main`). You fill in `project_url`.
+[agents]
+# "durable" (default): workers run on Pi Durable inside the service.
+# "rpc": each worker is a full `pi --mode rpc` process with all of your Pi extensions.
+runtime = "durable"
+# Optional normal Pi model patterns. Omit to use Pi's settings/saved session model.
+planner_model = "provider/planning-model"
+implementer_model = "provider/implementation-model"
+reviewer_model = "provider/review-model"
 
-  ```toml
-  project_url = "https://github.com/users/rowantran/projects/123"
-  base_branch = "main"
-  ```
+[orchestration]
+max_concurrency = 3
+poll_interval_ms = 15000
+agent_timeout_ms = 3600000
+max_attempts = 3
+max_review_rounds = 3
 
-The repository and checkout are not configured: `gho` uses the git checkout you run it in (any worktree or subdirectory of it) and the GitHub repository of its `origin`. Unknown keys are an error. `gho doctor` checks that you can read the Project, warns when an agent model is not set, and warns when the installed `gho` is not the latest version. `gho config` prints the loaded config as JSON.
+[obsidian]
+# vault = "/path/to/vault"
+```
 
-Use another config directory with `GHO_CONFIG_DIR` or `gho --config-dir PATH`. Worktrees go wherever your Worktrunk configuration puts them.
+`~/.config/github-orchestrator/repos/OWNER/REPO.toml`:
 
-To update later: rerun the `cargo install` command and `pi update git:github.com/rowantran/github-orchestrator`. `gho doctor` tells you when to: every commit on `main` is a new version, and it compares the commit that `gho` was built from with the tip of `main` on GitHub (`git ls-remote`, no credentials needed).
+```toml
+project_url = "https://github.com/users/your-github-login/projects/123"
+base_branch = "main"
+```
 
-## Use it through the orchestrator
+Repository settings can override the `[orchestration]` values. The checkout's `origin` selects the repository. `--config-dir PATH` or `GHO_CONFIG_DIR` selects a different configuration directory. Unknown keys fail validation. Restart the service after changing its configuration.
 
-Start Pi in your clone. It lists the `github-orchestrator` skill and loads it when you ask to plan or run queue work; `/skill:github-orchestrator` forces it. The commands the skill uses:
+**Migration:** `gho` is now the npm-installed TypeScript CLI; the Rust implementation has been removed. Existing TOML configuration, branches, workstreams, and TaskNotes associations remain usable. If you previously installed the Cargo binary, check `command -v gho` after linking and adjust `PATH` or uninstall the old Cargo package so the npm executable is selected. Existing manually managed worktrees are not silently adopted into agent execution. The old tmux pane controls and `--gho-agent` status extension are replaced by the service-owned sessions, dashboard chat, and `gho agent` commands.
+
+## Plan, register, and enroll work
+
+The installed `github-orchestrator` skill teaches your supervisor agent to use these commands:
 
 ```sh
 gho task create --title "One bounded change" --body-file task.md --blocked-by 41
-gho ready --json            # ready issues; --all adds blocked, in-progress and ready-for-review ones
-gho worktree 42             # new worktree from the latest origin/main
-gho worktree 43             # ready with stack_on [42]: starts from origin/rowantran/gh-42
-gho worktree 44 --base rowantran/gh-42   # start any issue, ready or not, from an explicit branch or commit
-gho config                  # config as JSON, including agents.implementer_model and agents.reviewer_model
-gho wait agents             # block until an agent settles; prints JSON with a cursor for --since
-gho wait review             # (implementers) block until a review is submitted on this branch's PR
+gho ready --json
+gho ready --all --json
+
+gho run 42 --mode supervised
+gho run 43 44 --mode unsupervised
+gho status
+gho status 42
 ```
 
-**States.** `gho` classifies every issue, in this order:
+Each issue should contain its goal, scope, acceptance criteria, and verification commands. `run` enrolls explicit tasks; it does not start arbitrary issues from your Project. Blocked tasks wait until their dependencies are ready. Repeating enrollment with the same mode is idempotent; changing a running task's mode is rejected.
 
-| State | Meaning |
-| --- | --- |
-| `done` | Closed as *completed*. |
-| `closed` | Closed as not planned or duplicate. Never unblocks dependents. |
-| `ready_for_review` | An open pull request that is not a draft comes from `<owner>/gh-N`. |
-| `in_progress` | An open draft pull request comes from `<owner>/gh-N`, or the branch exists locally with no open pull request. |
-| `ready` | No branch yet, and every blocker is `done` or `ready_for_review`. |
-| `blocked` | Anything else. |
+Both workflows commit a pseudocode/stub skeleton at the real implementation paths and open a draft PR:
 
-Only `ready` issues can be picked up. A ready issue's `stack_on` lists its blockers that are ready for review, bottom first; `gho worktree N` starts from the last one's branch, or from the latest base branch when the list is empty. Blockers under review must lie on one chain of pull requests (each based on the branch below it), because a branch can only start from one of them; otherwise the issue is blocked. `gho` finds pull requests by head branch, because GitHub does not link stacked pull requests to issues through "Closes #N". Only issues in the configured repository have branches, so blockers elsewhere are never `in_progress` or `ready_for_review`.
+| Phase | Supervised | Unsupervised |
+| --- | --- | --- |
+| Plan | Commit and push skeleton; open draft PR | Same |
+| Approval | Wait for explicit approval of the full skeleton SHA | Record automatic workflow approval |
+| Implement | Continue the same Pi session; optionally change model | Same |
+| Review | Separate reviewer; findings return to implementer within a bounded fix loop | Same |
+| Publish | Service marks PR ready after review and CI pass | Same |
+| Merge | Human decision | Human decision |
 
-`gho ready` lists open issues assigned to you in the Project, with each blocker's state, local branch, worktree and pull requests. `gho worktree N` refuses issues that are not ready unless you pass `--base`.
+Planner and implementer are the **same saved conversation**, even when their model or process changes. A reviewer has its own conversation. Only one agent writes a task's worktree at a time. An idle approval gate consumes no agent slot. Checks that are pending prevent publication; a repository with no CI checks relies on the worker's and reviewer's recorded verification.
 
-**Task brief.** `gho worktree N` fills in the template [`agent-context/brief.md`](agent-context/brief.md) and writes it to `.gho/brief.md` in the new worktree. The brief gives the issue, the branch, and the base branch that the pull request targets. The base branch is the branch that the worktree started from, or the configured base branch when `--base` is a commit or tag. `.gho/` contains its own `.gitignore`, so the brief is never committed. The orchestrator gives the brief to the implementer and reviewer agents as their first message.
+The default review/CI fix limit is three rounds. Failed or interrupted agent attempts have bounded retries and backoff. A question or exhausted retry budget blocks the task and is visible in the dashboard. `resume` explicitly retries after you resolve it.
 
-## Waiting for agents and reviews
+## Approve, inspect, and nudge
 
-Both commands block, check at an interval, and print one JSON object when they end. Each prints a `cursor`; pass it to the next call as `--since CURSOR`, so the events it already reported do not end that call again. `--timeout SECONDS` gives up with `"result": "timeout"`, and `--interval SECONDS` sets how often they check. After a first successful check, up to five consecutive failed checks (for example, a network error) are retried.
+```sh
+gho dashboard
+gho dashboard --tailscale-serve --port 8080
+gho approve 42 --sha FULL_SKELETON_COMMIT_SHA
 
-**`gho wait agents [N | N/AGENT]... [--all]`** is for the orchestrator. It ends when an agent settles: the agent finished its run and waits for a message, waits for an answer to a dialog in its terminal (`prompting`), quit (`exited`), or stopped updating its status without quitting (`lost`, after 60 seconds). Without arguments it watches every agent in every issue worktree; `42` watches the agents in issue 42's worktree, and `42/reviewer` one of them. `--all` ends only when every watched agent is settled at the same time. The output lists each agent's state, whether it is `new` since the cursor, the end of its last message, and its Pi session file.
+gho agent show 42 --role implementer
+gho agent message 42 "Reconsider the error handling" --role implementer
+gho agent message 42 --file feedback.md --role reviewer
+gho pause 42
+gho resume 42
+```
 
-The agent statuses come from the Pi extension in [`extensions/agent-status.mjs`](extensions/agent-status.mjs), which this package installs. It does nothing unless Pi starts with `--gho-agent=NAME`, as the skill's launch commands do. Then it writes `.gho/agents/NAME.json` in the agent's working directory (the worktree) on every state change and every 5 seconds. `gho wait agents` only reads these files. It waits up to 30 seconds for an expected status to appear after a launch.
+The dashboard keeps the dependency graph and workstream filters. Select a task to start it, inspect its lifecycle, choose an agent, read messages and tool activity, send a message, answer supported Pi extension dialogs, or approve the displayed skeleton revision. Local agent polling does not refresh GitHub's entire graph.
 
-**`gho wait review [--pr N]`** is for implementers. It ends when someone submits a review on the pull request (by default the open pull request from the current branch), or when the pull request is merged or closed. It prints each new review with its body and inline comments. Comments in a pending review stay invisible until you submit the review, so the implementer gets them as one batch. Reviews by agents (every text starts with `[agent:]`) are ignored. GitHub stores **Add single comment** and replies outside a pending review as one-comment reviews, so those also end the wait; use **Start a review** to batch comments. Comments in the pull request's conversation tab are not reviews and do not end the wait. It checks GitHub every 30 seconds by default.
+Approval is available through the dashboard, CLI, or a GitHub PR conversation comment/submitted review containing exactly:
 
-## Workstreams and the graph dashboard
+```text
+/gho approve FULL_SKELETON_COMMIT_SHA
+```
 
-A **workstream** is a named subset of the tasks in your repository. Use one for a subproject, feature, or cross-cutting effort. Tasks can belong to several workstreams, and their blockers do not need to belong to the same workstream.
+GitHub approval commands must come from the configured `owner`. A changed revision requires a new approval. GitHub feedback is delivered as phase input; agent comments beginning with `[agent:]` are ignored. Pending review comments are not delivered until submitted.
+
+A nudge is **not approval**. Nudging a planner at the approval gate starts skeleton revision, not implementation. Messages to paused/blocked work are retained but do not resume it. A supervisor may run `approve` when you explicitly ask it to approve that revision. The workflow never interprets “looks good” as permission.
+
+### Worker runtimes
+
+**Durable (default).** Each task role is a [Pi Durable](https://earendil.com/posts/pi-durable/) conversation hosted by the service. Workers inherit from your normal Pi configuration:
+
+- credentials (`auth.json`), `models.json`, and providers that installed Pi extensions register (for example a company LLM proxy);
+- the default provider, model, and thinking level, plus compaction, retry, steering, follow-up, shell, and HTTP proxy/timeout settings;
+- global and project `AGENTS.md`/context files, skills (including skills from Pi packages), `SYSTEM.md`, and `APPEND_SYSTEM.md`, rendered by Pi's own system prompt builder.
+
+Workers get `read`, `bash`, `edit`, `write`, and `gho_report`. Pi extension tools, hooks, commands, MCP servers, and dialogs do **not** run in durable workers; Pi extensions load only so their providers register. Extensions that choose a model at session start (for example a machine-local model override) have no effect; set `agents.*_model` instead. `gho doctor` loads your Pi configuration like the service and shows which model each role resolves to, without contacting a model. Durable workers depend on the exact pinned Pi version because Pi does not export its system prompt builder.
+
+**RPC.** Set `runtime = "rpc"` to launch the actual `pi --mode rpc` executable per role. It loads every Pi extension, tool, and MCP server and supports standard extension dialogs, answered explicitly in the dashboard; terminal-specific custom UI is not supported. Tested with Pi 0.99.2. In that version, an extension that awaits a dialog inside `session_start` can block before Pi installs its RPC input reader; defer that dialog to an input/tool hook or give it a finite timeout. The service reports startup failure rather than automatically approving it.
+
+The service adds its own instructions and a structured `gho_report` tool in both runtimes. Changing the runtime of a task that already has a conversation starts a new conversation for that role; the recovery prompt tells it to inspect existing work first.
+
+## Service lifecycle and recovery
+
+```sh
+gho service start               # independent background service
+gho service status
+gho service stop                # saves state and stops owned agents
+gho serve                       # foreground alternative
+```
+
+`run` and `dashboard` start the service if needed. One service owns a repository's Git common directory, including its worktrees. Each worker also holds an OS lock for its worktree, so a replacement cannot overlap a delayed old worker. Configure it under a process manager if it must restart automatically after machine/process failure.
+
+GitHub remains the task store. Private execution checkpoints, event journals, the service descriptor, and logs live in `<git-common-dir>/gho-service/`. Worker conversations (`.gho/sessions/<session>.sqlite` for durable workers, Pi JSONL sessions for RPC workers) and phase reports live in each worktree's ignored `.gho/`. There is no local task database. Preserve these files to preserve approvals and conversation identity; they may contain sensitive task and agent output.
+
+A restart reuses the same task/role session IDs, preserves approval gates, and checks persisted phase reports before resuming an interrupted turn. A durable worker continues its interrupted turn by itself: a cut-off model request is sent again, an interrupted `bash`/`edit`/`write` call is reported to the model as interrupted rather than rerun, and queued nudges are delivered into that turn. Pausing or stopping the service keeps such a turn for later; a run that exceeds its deadline is aborted first. An RPC worker instead receives a recovery prompt. This is task/session recovery, not exactly-once execution of arbitrary shell commands. Recovery instructions require inspecting existing Git/GitHub effects before repeating actions. Do not concurrently open a service-owned session in another Pi process; inspect and message it through the dashboard/CLI instead.
+
+## Task dependencies and workstreams
+
+`ready` lists open issues assigned to the configured owner in the configured Project. Task states remain:
+
+- `done`: issue closed as completed.
+- `closed`: not planned or duplicate; never unblocks dependents.
+- `ready_for_review`: an open, non-draft PR from `<owner>/gh-N`.
+- `in_progress`: a draft PR or existing local branch.
+- `ready`: no branch, and every blocker is done or ready for review.
+- `blocked`: everything else.
+
+Blockers under review must form one PR chain. New work starts from its top, or the latest configured base branch when no stack is needed. PRs are found by branch because closing keywords do not link stacked PRs reliably. A merged PR finishes its local execution, but dependents and TaskNotes still use the GitHub issue's completion state. Close a delivered stacked issue as completed when GitHub cannot apply its closing keyword. `gho worktree N --base REF` remains an explicit manual readiness override; service enrollment does not use it.
 
 ```sh
 gho workstream create project-a
 gho workstream create project-a/feature-1
-gho workstream create shared-platform
-gho workstream add project-a 41 42 43
-gho workstream add project-a/feature-1 42 43
-gho workstream add shared-platform 42 50
-gho workstream remove project-a/feature-1 43
+gho workstream add project-a 41 42
+gho workstream remove project-a 42
 gho workstream list --json
-
-# Assign memberships while creating a task (create the workstreams first):
-gho task create --title "One bounded change" --body-file task.md \
-  --workstream project-a --workstream project-a/feature-1
-
-# Run from a configured repository checkout, then open the printed URL:
-gho dashboard
-# Optional: choose a port and restrict focus to an exact tmux session name:
-gho dashboard --port 8080 --tmux-session agents
-# Optional: share through Tailscale Serve, with no manual proxy configuration:
-gho dashboard --tailscale-serve --port 8080 --tmux-session agents
+gho task create --title "Change" --body-file task.md --workstream project-a
 ```
 
-Memberships are GitHub labels named `gho:workstream:NAME`. They survive across machines and can also be edited on GitHub. Adding or removing a membership preserves all other labels. Names use letters, digits, `.`, `_`, `-`, and `/`, with each slash-separated segment starting with a letter or digit; the name is at most 35 characters. Names are case-insensitive on GitHub. A slash is just part of a name: `project-a/feature-1` does **not** automatically include a task in `project-a`. Add both memberships when you want both views. Empty workstreams remain selectable. Membership commands accept issue numbers or full issue URLs from this repository.
+Memberships are overlapping GitHub labels, `gho:workstream:NAME`. Slash-separated names do not inherit membership. The graph includes completed, closed, archived, and other-assignee Project issues. Filtering never changes readiness; external blockers remain visible in task details.
 
-The dashboard's **All tasks** view includes all issues in the configured repository and Project, regardless of assignee, including completed, closed, and archived Project items. This is broader than `gho ready`, which still shows only your open queue. Labels alone do not add an issue to the Project.
+## Local and tailnet access
 
-- Select a workstream to see its dependency graph. Arrows point from a blocker to its dependent task.
-- Colors and text distinguish **Blocked**, **Ready**, **In progress**, **Ready for review**, **Complete**, and **Closed**. Closed means not planned or duplicate, not completed.
-- Filtering never recalculates readiness. A task blocked by something outside the visible graph stays blocked. Select it to inspect all blockers, including links outside this view.
-- Select a task to open its GitHub issue, draft/published/merged PRs, or focus an existing agent pane. Multiple matching panes appear in a selector.
-- Search tasks, pan the graph, zoom, or fit it to the viewport. Refresh manually or enable the optional 60-second refresh. A failed refresh reports an error instead of replacing the graph with an empty result.
+The server binds only to `127.0.0.1`. API requests require its private session token, exact Host/Origin checks, and same-origin browser access. The browser never receives GitHub credentials. Use an SSH tunnel for remote access or explicit `--tailscale-serve`.
 
-**tmux focus.** Run the dashboard on the machine and tmux server where the agents run. The orchestrator skill tags agent panes with `@gho_repo` and `@gho_issue`. Existing untagged panes also work when exactly one live pane has the task worktree root as its current directory. Ambiguous matches and panes in subdirectories need tags. Without `--tmux-session`, discovery uses the inherited tmux session when run inside tmux, otherwise the default server. Focus selects the verified window and pane; clients attached to that session see the selection. It does not open a terminal, attach a client, switch unrelated sessions, or send input. Missing tmux disables focus without hiding tasks.
+Tailscale sharing uses only an owned temporary foreground Serve process, refuses occupied Serve/Funnel ports, keeps the backend on a separate loopback port, and leaves unrelated mappings alone. It never enables Funnel, uses sudo, or changes tailnet policy. Tailnet access rules are the authorization boundary: anyone allowed to reach the dashboard can read agent output, send messages, approve skeletons, and control tasks. Restrict those rules. Do not expose it through a public proxy.
 
-Each refresh reads the configured Project's items directly, including archived items, then fetches matching issues and PR links in batches. It does not scan the repository's issue or pull request history. Large Projects can take longer to load. A refresh has a 90-second subprocess budget; failures keep the last successful view and show an error. Automatic refresh is off by default to avoid unnecessary GitHub API use; it waits for the preceding request to finish and pauses in a hidden tab.
-
-**Local access.** The dashboard binds only to `127.0.0.1`, uses an available port by default, and stops with Ctrl-C. It serves bundled assets with no frontend build or external CDN. API calls require a per-process token; foreign hosts and origins are rejected. No GitHub credentials are sent to the browser and no task database is created. For a remote machine, use an SSH tunnel with the same local and remote port, then open `http://127.0.0.1:PORT/`. Do not expose the dashboard through a public proxy.
-
-### Tailscale access
-
-Run `gho dashboard --tailscale-serve --tmux-session dune-storage` on the machine hosting the agent panes. It detects the node's Tailscale DNS name and prints an HTTP URL such as `http://rowan-v2-dev:8080/`. Both the short MagicDNS name and the full Tailscale DNS name are accepted. The browser machine must be on the tailnet and able to resolve the name.
-
-With this flag, `--port` selects the **tailnet HTTP port** (8080 when omitted or zero). The backend still binds only to `127.0.0.1`, on a separate OS-selected port. `gho` starts a temporary foreground `tailscale serve` process, confirms its mapping, and allows only the detected node names and the backend's loopback address. Host, Origin, API-token, and content-security checks remain enabled. It does not enable Funnel or expose a public internet endpoint.
-
-Tailscale must be installed, running, and logged in, with MagicDNS enabled and foreground Serve support (checked against Tailscale 1.102.2). Your OS user must have permission to configure Serve; `gho` does not run `sudo`, log you in, or change tailnet policy. It refuses a port already configured in Serve or Funnel rather than overwriting it. Other services are left unchanged. Ctrl-C or SIGTERM stops the owned Serve process during shutdown; an active GitHub refresh may take up to its 90-second deadline to finish. No persistent Serve mapping is created.
-
-**Access is controlled by your tailnet rules, not a dashboard login.** Anyone allowed to reach this port can read the Project's task data and select existing tmux panes. Restrict access accordingly. The page uses HTTP inside Tailscale's encrypted network, not HTTPS. Do not put a public proxy in front of it.
+These controls protect the service interface, not arbitrary agent tool execution. Workers run with the permissions and credentials of normal Pi; use your normal sandbox and trust only the repositories/tasks you enroll.
 
 ## Optional TaskNotes bridge
 
-Links Obsidian task notes to GitHub issues and marks the note done when all its issues are completed.
-
 ```sh
-# From a clone of this repository (the plugin is not part of the cargo install):
 (cd obsidian-plugin && npm ci && npm test && npm run build)
-cargo run -- notes install    # then enable the plugin in Obsidian yourself
+gho notes install --yes           # enable the plugin in Obsidian yourself
 gho notes link "Tasks/example.md" 42 43
-gho notes complete          # request completion for notes whose issues are all completed
+gho notes list
+gho notes complete
 ```
 
-`notes link` replaces a note's issue set; `task create --note` adds to it. `notes complete` skips pending or accepted requests; use `--retry` for failed or stale ones. See the [plugin README](obsidian-plugin/README.md).
+Only issues closed as completed count toward note completion. See [obsidian-plugin/README.md](obsidian-plugin/README.md).
 
-## Development
-
-Work from a clone: `cargo run -- …`. To load your local skill edits in Pi instead of the GitHub version, `pi install /absolute/path/to/clone` (and `pi remove` the git source).
+## Development and verification
 
 ```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
-(cd obsidian-plugin && npm ci && npm test && npm run build)
+npm ci
+npm test                         # core, engine, RPC, Pi Durable, HTTP, CLI, and Pi integration tests
+npm run test:browser              # Playwright CLI: real HTTP server and browser flows
 (cd dashboard && npm test && npm run build)
-npm test                    # the agent status extension
-# Browser integration tests: see tests/dashboard_e2e/README.md
+(cd obsidian-plugin && npm ci && npm test && npm run build)
 ```
 
-Tests use temporary repositories, a local bare repository in place of GitHub, and a fake `gh`. They never write to real GitHub or a real vault. The Worktrunk tests run when `wt` is on `PATH`.
+Browser setup: `npx playwright install --with-deps chromium`. Tests use temporary repositories/vaults, fake GitHub/Pi subprocesses, and isolated service state. The installed-Pi smoke test exercises real RPC resource discovery without a model request or real credentials. Durable worker tests use Pi's faux provider and a local OpenAI-compatible fake server. No test creates real issues/PRs or changes a real vault.
 
-See [docs/architecture.md](docs/architecture.md) for the module layout.
+[docs/architecture.md](docs/architecture.md) describes implementation ownership. [tests/orchestration-browser/README.md](tests/orchestration-browser/README.md) describes the Playwright CLI suite for the TypeScript service and dashboard.

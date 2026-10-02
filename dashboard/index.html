@@ -28,12 +28,13 @@
         <ul id="status-legend" class="status-legend"></ul>
         <p class="filter-help">Complete means completed. Closed means not planned or duplicate; it does not unblock other tasks.</p>
       </section>
+      <section id="run-list-section" class="run-list-section" aria-labelledby="run-list-title" hidden><h2 id="run-list-title" class="eyebrow">Local execution</h2><div id="run-list"></div></section>
       <div class="sidebar-footer"><span class="dependency-key" aria-hidden="true">○ ───→ ○</span><p>Arrows go from blocker to dependent. Only tasks in this view are connected.</p><p>All tasks includes completed and closed work.</p></div>
     </aside>
     <section class="main-panel" aria-label="Task dashboard">
       <div class="view-header"><div><span class="eyebrow">Dependency graph</span><h2 id="view-title">All tasks</h2><p id="view-summary">Loading your task graph…</p></div><div class="refresh-controls"><label class="auto-refresh"><input id="auto-refresh" type="checkbox">Refresh every 60s</label><button id="refresh-button" class="button secondary" type="button">Refresh</button><span id="refresh-status" role="status">Connecting…</span></div></div>
       <div id="error-banner" class="banner error-banner" role="alert" hidden></div>
-      <div id="tmux-warning" class="banner warning-banner" role="status" hidden></div>
+      <div id="runtime-status" class="banner runtime-status" role="status" hidden></div>
       <div class="graph-toolbar"><div class="search-box"><span aria-hidden="true">⌕</span><input id="task-search" type="search" placeholder="Search title, #number, branch…" aria-label="Search tasks" autocomplete="off"></div><div class="zoom-controls" role="group" aria-label="Graph zoom"><button id="zoom-out" class="icon-button" type="button" aria-label="Zoom out">−</button><output id="zoom-level" aria-label="Zoom level">100%</output><button id="zoom-in" class="icon-button" type="button" aria-label="Zoom in">+</button><span class="control-divider"></span><button id="fit-graph" class="button compact" type="button">Fit graph</button></div></div>
       <div id="workspace" class="workspace">
         <div id="graph-viewport" class="graph-viewport" tabindex="0" role="region" aria-label="Task dependency graph" aria-describedby="graph-help">
