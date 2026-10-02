@@ -1,10 +1,13 @@
-//! The gho command: register work, find ready work, create worktrees. Agents are launched by the orchestrator.
+//! The gho command: register work, find ready work, create worktrees, wait for agents and reviews.
+//! Agents are launched by the orchestrator.
 
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
@@ -14,9 +17,10 @@ use crate::github::GitHub;
 use crate::notes::{Notes, Status, note_path};
 use crate::paths::{expand_user, resolve};
 use crate::process::{Cmd, Runner, System, which};
+use crate::wait::{Schedule, poll};
 use crate::work::{Blocker, Entry, Issues, State, classify, survey};
 use crate::workspace::{Created, Workspace, locate, origin_default_branch};
-use crate::{Error, Result, bail, brief, dashboard, ensure, workstreams};
+use crate::{Error, Result, agents, bail, brief, dashboard, ensure, reviews, workstreams};
 
 #[derive(Debug, Parser)]
 #[command(name = "gho", version, about = "Your GitHub issue queue → ready work → Worktrunk worktrees.")]
@@ -72,9 +76,52 @@ pub enum Command {
         #[arg(long)]
         tmux_session: Option<String>,
     },
+    /// Block until agents settle or a pull request gets a review, then print JSON. Run it in the background.
+    #[command(subcommand)]
+    Wait(WaitCommand),
     /// Optional TaskNotes bridge
     #[command(subcommand)]
     Notes(NotesCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WaitCommand {
+    /// Wait until an agent launched with pi --gho-agent=NAME settles: it finishes its run, waits for an
+    /// answer to a dialog, quits, or dies
+    Agents {
+        /// Issue numbers (every agent in that issue's worktree) or ISSUE/AGENT such as 42/reviewer
+        /// [default: every agent in every issue worktree]
+        targets: Vec<String>,
+        /// End only when every agent is settled at the same time
+        #[arg(long)]
+        all: bool,
+        /// The cursor the previous wait printed; agents that have not changed since then do not end this wait
+        #[arg(long)]
+        since: Option<String>,
+        /// Seconds before giving up with result "timeout" [default: wait until something happens]
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Seconds between checks of the agents' status files
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+    },
+    /// Wait until someone submits a review on a pull request (one batch of comments, not single comments
+    /// in a pending review), or the pull request is merged or closed. Reviews by agents are ignored.
+    Review {
+        /// Pull request number [default: the open pull request from the current branch]
+        #[arg(long)]
+        pr: Option<u64>,
+        /// The cursor the previous wait printed; reviews it covers do not end this wait [default: none,
+        /// so every review on the pull request counts]
+        #[arg(long)]
+        since: Option<String>,
+        /// Seconds before giving up with result "timeout" [default: wait until something happens]
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Seconds between GitHub checks
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        interval: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -194,6 +241,7 @@ pub fn run(cli: Cli, runner: &dyn Runner, out: &mut dyn Write) -> Result<()> {
             dashboard::serve(&config, runner, port, tailscale_serve, tmux_session.as_deref(), out)
         }
         Command::Workstream(command) => run_workstream(command, &config, &github, out),
+        Command::Wait(command) => run_wait(command, &config, &github, &workspace, out),
         Command::Task(TaskCommand::Create { title, body_file, blocked_by, workstream, note }) => {
             let body = fs::read_to_string(&body_file)
                 .map_err(|error| Error::msg(format!("Cannot read {}: {error}", body_file.display())))?;
@@ -289,6 +337,54 @@ fn run_workstream(command: WorkstreamCommand, config: &Config, github: &GitHub, 
         }
     }
     Ok(())
+}
+
+fn schedule(interval: u64, timeout: Option<u64>) -> Schedule {
+    Schedule { interval: Duration::from_secs(interval), timeout: timeout.map(Duration::from_secs) }
+}
+
+fn run_wait(
+    command: WaitCommand,
+    config: &Config,
+    github: &GitHub,
+    workspace: &Workspace,
+    out: &mut dyn Write,
+) -> Result<()> {
+    match command {
+        WaitCommand::Agents { targets, all, since, timeout, interval } => {
+            let targets = targets.iter().map(|target| agents::Target::parse(target)).collect::<Result<Vec<_>>>()?;
+            let cursor = agents::Cursor::parse(since.as_deref().unwrap_or("start"))?;
+            let mode = if all { agents::Mode::All } else { agents::Mode::Any };
+            let watch = agents::Watch::new(config, targets, mode, cursor);
+            let started = Instant::now();
+            let mut last = Vec::new();
+            let settled = poll(&schedule(interval, timeout), || {
+                let (mut found, missing) = watch.observe(&workspace.worktrees()?, Utc::now())?;
+                if watch.decide(&mut found, &missing, started.elapsed())? {
+                    return Ok(Some(watch.outcome(agents::End::Settled, found)));
+                }
+                last = found;
+                Ok(None)
+            })?;
+            print_json(out, &settled.unwrap_or_else(|| watch.outcome(agents::End::Timeout, last)))
+        }
+        WaitCommand::Review { pr, since, timeout, interval } => {
+            let cursor = reviews::Cursor::parse(since.as_deref().unwrap_or("start"))?;
+            let number = match pr {
+                Some(number) => number,
+                None => {
+                    let branch = workspace.current_branch()?;
+                    match github.open_pull_request(&branch)? {
+                        Some(pull_request) => pull_request.number,
+                        None => bail!("No open pull request from {branch}. Pass --pr N."),
+                    }
+                }
+            };
+            let mut watch = reviews::Watch::new(github, number, cursor);
+            let outcome = poll(&schedule(interval, timeout), || watch.check())?;
+            print_json(out, &outcome.unwrap_or_else(|| watch.timed_out()))
+        }
+    }
 }
 
 /// The result of `gho worktree`.

@@ -5,10 +5,11 @@
 1. **Register work:** create GitHub issues assigned to you, added to your Project, with native "blocked by" links.
 2. **Find ready work:** list open issues in your queue that you can start: every blocker is done, or has an open pull request to stack on.
 3. **Create a worktree:** make branch `<owner>/gh-N` for a ready issue in a new Worktrunk worktree, from the latest base branch or stacked on its blockers' pull requests. The worktree gets a task brief for the issue's agents in `.gho/brief.md`, which Git ignores.
+4. **Wait:** block until agents settle (`gho wait agents`) or until someone submits a review on a pull request (`gho wait review`). Agents run these in the background, so they need no polling logic of their own and use no context while nothing happens.
 
 You can also group tasks into overlapping workstreams and view their dependencies in a local dashboard. The dashboard opens PR links and selects existing agent panes in tmux; it does not launch or manage agents.
 
-The agent you talk to handles the implementation workflow. It launches an implementer agent in each worktree, in its own tmux window. The implementer first commits a skeleton (pseudocode and stubs at the real paths) and opens a draft PR with it. You review the skeleton in PR comments, and the implementer answers there, with every comment prefixed `[agent:]`. When you approve, it implements the change, pushes it to the same PR, and marks the PR ready for review. Then the orchestrator launches a reviewer agent on it. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells the orchestrator how; `implementer.md` and `reviewer.md` next to it are the other agents' standing instructions. This repository is a Pi package that ships them.
+The agent you talk to handles the implementation workflow. It launches an implementer agent in each worktree, in its own tmux window. The implementer first commits a skeleton (pseudocode and stubs at the real paths) and opens a draft PR with it. You review the skeleton in PR comments, and the implementer answers there, with every comment prefixed `[agent:]`. When you approve, it implements the change, pushes it to the same PR, and marks the PR ready for review. Then the orchestrator launches a reviewer agent on it. The skill in [`agent-context/github-orchestrator/SKILL.md`](agent-context/github-orchestrator/SKILL.md) tells the orchestrator how; `implementer.md` and `reviewer.md` next to it are the other agents' standing instructions. This repository is a Pi package that ships them, and a Pi extension that records each agent's activity for `gho wait agents`.
 
 GitHub is the only task store. `gho` keeps no local state: a task is "in progress" when its branch exists or it has a draft pull request, and "ready for review" when an open pull request that is not a draft comes from that branch.
 
@@ -66,6 +67,8 @@ gho worktree 42             # new worktree from the latest origin/main
 gho worktree 43             # ready with stack_on [42]: starts from origin/rowantran/gh-42
 gho worktree 44 --base rowantran/gh-42   # start any issue, ready or not, from an explicit branch or commit
 gho config                  # config as JSON, including agents.implementer_model and agents.reviewer_model
+gho wait agents             # block until an agent settles; prints JSON with a cursor for --since
+gho wait review             # (implementers) block until a review is submitted on this branch's PR
 ```
 
 **States.** `gho` classifies every issue, in this order:
@@ -84,6 +87,16 @@ Only `ready` issues can be picked up. A ready issue's `stack_on` lists its block
 `gho ready` lists open issues assigned to you in the Project, with each blocker's state, local branch, worktree and pull requests. `gho worktree N` refuses issues that are not ready unless you pass `--base`.
 
 **Task brief.** `gho worktree N` fills in the template [`agent-context/brief.md`](agent-context/brief.md) and writes it to `.gho/brief.md` in the new worktree. The brief gives the issue, the branch, and the base branch that the pull request targets. The base branch is the branch that the worktree started from, or the configured base branch when `--base` is a commit or tag. `.gho/` contains its own `.gitignore`, so the brief is never committed. The orchestrator gives the brief to the implementer and reviewer agents as their first message.
+
+## Waiting for agents and reviews
+
+Both commands block, check at an interval, and print one JSON object when they end. Each prints a `cursor`; pass it to the next call as `--since CURSOR`, so the events it already reported do not end that call again. `--timeout SECONDS` gives up with `"result": "timeout"`, and `--interval SECONDS` sets how often they check. After a first successful check, up to five consecutive failed checks (for example, a network error) are retried.
+
+**`gho wait agents [N | N/AGENT]... [--all]`** is for the orchestrator. It ends when an agent settles: the agent finished its run and waits for a message, waits for an answer to a dialog in its terminal (`prompting`), quit (`exited`), or stopped updating its status without quitting (`lost`, after 60 seconds). Without arguments it watches every agent in every issue worktree; `42` watches the agents in issue 42's worktree, and `42/reviewer` one of them. `--all` ends only when every watched agent is settled at the same time. The output lists each agent's state, whether it is `new` since the cursor, the end of its last message, and its Pi session file.
+
+The agent statuses come from the Pi extension in [`extensions/agent-status.mjs`](extensions/agent-status.mjs), which this package installs. It does nothing unless Pi starts with `--gho-agent=NAME`, as the skill's launch commands do. Then it writes `.gho/agents/NAME.json` in the agent's working directory (the worktree) on every state change and every 5 seconds. `gho wait agents` only reads these files. It waits up to 30 seconds for an expected status to appear after a launch.
+
+**`gho wait review [--pr N]`** is for implementers. It ends when someone submits a review on the pull request (by default the open pull request from the current branch), or when the pull request is merged or closed. It prints each new review with its body and inline comments. Comments in a pending review stay invisible until you submit the review, so the implementer gets them as one batch. Reviews by agents (every text starts with `[agent:]`) are ignored. GitHub stores **Add single comment** and replies outside a pending review as one-comment reviews, so those also end the wait; use **Start a review** to batch comments. Comments in the pull request's conversation tab are not reviews and do not end the wait. It checks GitHub every 30 seconds by default.
 
 ## Workstreams and the graph dashboard
 
@@ -161,6 +174,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 (cd obsidian-plugin && npm ci && npm test && npm run build)
 (cd dashboard && npm test && npm run build)
+npm test                    # the agent status extension
 # Browser integration tests: see tests/dashboard_e2e/README.md
 ```
 

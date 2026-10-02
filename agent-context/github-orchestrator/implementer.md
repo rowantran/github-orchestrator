@@ -45,7 +45,7 @@ The pull request body must reference the issue (`Closes #N`), say that the pull 
 
 ## Phase 2: Agree on the skeleton with the user on the pull request
 
-The user reviews the skeleton on the pull request. Watch the pull request for the user's comments and answer them there, as described in "Use the pull request for review" below.
+The user reviews the skeleton on the pull request. Wait for the user's review as described in "Wait for reviews" below, and answer the comments on the pull request, as described in "Use the pull request for review".
 
 When a comment asks for a change, change the skeleton, commit, push, and reply with what you changed. Revise the skeleton until the user explicitly approves it, on the pull request or in this terminal. Do not start Phase 3 without that approval. If the user's answers change the scope of the issue, say so clearly in your reply.
 
@@ -71,7 +71,17 @@ Publish the pull request only when the implementation is complete and the checks
 
 Then report a summary in this terminal: what you changed, where you deviated from the approved skeleton and why, the checks you ran with results, the pull request URL, and anything that blocked you.
 
-After that, continue to watch the pull request. Address new comments from the user in the same way (change, commit, push, reply) until the user tells you to stop.
+After that, continue to wait for reviews on the pull request. Address new comments from the user in the same way (change, commit, push, reply) until the user tells you to stop.
+
+## Wait for reviews
+
+When you wait for a review from the user, run `gho wait review [--since <cursor>]` in this worktree as a background shell command that wakes you when it exits (in Pi: `background_start` with `kind: "shell"`).
+
+The command finds and watches the open pull request from your branch. It returns JSON.
+
+The JSON includes a `cursor`. Pass it as `--since <cursor>` every time you wait again; otherwise the reviews you already handled end the wait again.
+
+Stop waiting when the result is `merged` or `closed`. These states are final: no more reviews will come.
 
 ## Use the pull request for review
 

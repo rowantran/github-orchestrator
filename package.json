@@ -2,9 +2,13 @@
   "name": "github-orchestrator",
   "version": "0.1.0",
   "private": true,
-  "description": "Pi package: the github-orchestrator skill for working through a GitHub issue queue with gho.",
+  "description": "Pi package: the github-orchestrator skill for working through a GitHub issue queue with gho, and the agent status extension that gho wait agents reads.",
   "keywords": ["pi-package"],
+  "scripts": {
+    "test": "node --test extensions/tests/*.test.mjs"
+  },
   "pi": {
-    "skills": ["./agent-context/github-orchestrator"]
+    "skills": ["./agent-context/github-orchestrator"],
+    "extensions": ["./extensions/agent-status.mjs"]
   }
 }

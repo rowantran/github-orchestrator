@@ -11,10 +11,12 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
         │ gho config           → agent models from the config
         │ gho workstream …     → overlapping issue memberships, stored as GitHub labels
         │ gho dashboard        → local graph + PR links + selection of existing tmux panes
+        │ gho wait agents      → blocks until an agent settles (reads .gho/agents/*.json)
         ▼
    implementer agents, one per worktree, each in a tmux window
    (skeleton → draft PR → agreed with you in PR comments → implementation → PR published)
-        │
+        │ gho wait review      → blocks until a review is submitted on the agent's PR
+        │ Pi extension         → writes .gho/agents/NAME.json when started with --gho-agent=NAME
         ▼
    reviewer agent per PR → orchestrator relays findings → you review and merge
 ```
@@ -25,7 +27,8 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 | --- | --- |
 | GitHub | Tasks: title, body, assignee, Project membership, blockers, open/closed and close reason. Workstream definitions and many-to-many memberships are repository labels. |
 | Git checkout | Work in progress: branch `<owner>/gh-N` and its worktree. With an open draft PR, the issue is still in progress; once the PR is published (not a draft), it is ready for review. |
-| `gho` | Reads the two above to classify issues; creates issues and worktrees; manages workstream labels and serves a read-only task graph. Can select an existing tmux pane, never launch or control its agent. No local database. |
+| `gho` | Reads the two above to classify issues; creates issues and worktrees; manages workstream labels and serves a read-only task graph. Can select an existing tmux pane, never launch or control its agent. Waits, read-only, for agent statuses and pull request reviews. No local database. |
+| Pi extension | Records each launched agent's activity in its worktree's `.gho/agents/NAME.json`. |
 | Orchestrator agent | Which tasks to start, launching and managing implementers, retries, stacking, review, publishing. |
 | You | Plan approval, what to run, when to publish, merging. |
 
@@ -45,10 +48,13 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 | `tests/dashboard_e2e/` | Playwright browser tests against the actual CLI in a temporary repository with fake GitHub responses. No real issues, PRs, or vaults. |
 | `src/workspace.rs` | Git and Worktrunk: find the checkout and its GitHub repository from the working directory, fetch the base, list worktrees, create the issue's worktree, find the branch its pull request targets. |
 | `src/brief.rs` | The task brief: fills in `agent-context/brief.md` (compiled in) and writes it to `.gho/brief.md` in the new worktree, next to a `.gitignore` that ignores `.gho/`. |
+| `src/wait.rs` | The polling loop of `gho wait`: interval, timeout, and retries of failed checks after a first success. |
+| `src/agents.rs`, `extensions/agent-status.mjs` | `gho wait agents`. The Pi extension writes one status file per agent (`starting`, `working`, `prompting`, `settled`, `exited`) with a 5-second heartbeat, replaced atomically. The Rust side reads them from issue worktrees, marks a status older than 60 seconds `lost`, and decides when the wait ends. The cursor maps each agent to the settling it last reported. |
+| `src/reviews.rs` | `gho wait review`. Reads a pull request, its reviews and its review comments over REST, ignores pending, dismissed and agent-written reviews, and returns new submitted reviews with their comments. The cursor is the last handled submission time with the IDs handled at that second. |
 | `src/process.rs` | Subprocesses as argument arrays with timeouts. The `Runner` trait lets tests replace `gh`. |
 | `src/notes.rs`, `obsidian-plugin/` | Optional TaskNotes bridge: note-to-issue links and completion request/receipt files. |
 | `agent-context/` | All model-facing text: the orchestrator skill (`SKILL.md`), the implementer and reviewer instructions it appends to their system prompts (`implementer.md`, `reviewer.md`), and the task brief template that `gho worktree` fills in (`brief.md`). |
-| `package.json` | Pi package manifest, so `pi install git:github.com/rowantran/github-orchestrator` installs the skill. |
+| `package.json` | Pi package manifest, so `pi install git:github.com/rowantran/github-orchestrator` installs the skill and the agent status extension. |
 
 ## Decisions
 
@@ -64,4 +70,7 @@ You ↔ orchestrator agent (Pi + the github-orchestrator skill)
 - **The brief is deterministic.** `gho worktree` writes each issue's task brief from a template, so every agent gets the same facts in the same form, and the orchestrator does not write briefs itself. The brief lives in the worktree, in a self-ignoring `.gho/` directory, so it needs no shared Git configuration and is removed with the worktree.
 - **Publishing a PR is the hand-off.** Implementers open a draft PR early, to review the skeleton on GitHub. A draft is unfinished work, so it does not count as ready for review and does not unblock dependents; marking the PR ready for review does. The workflow does not depend on agents remembering to ignore draft PRs.
 - **PRs are found by branch.** GitHub ignores closing keywords on PRs that target a non-default branch, so a stacked PR is never linked to its issue. `gho` looks up open PRs by head branch `<owner>/gh-N` in the configured repository instead.
+- **Waiting is deterministic and read-only.** Agents must not write their own polling loops or spend context on checks that find nothing. `gho wait` does the polling and returns one JSON result; agents run it as a background command. It never starts, stops, or sends input to an agent.
+- **Agent activity comes from Pi, not the terminal.** Reading tmux panes would depend on how Pi draws its screen. The extension reports Pi's own lifecycle events (`agent_start`, `agent_settled`, dialogs, quit) and a heartbeat, so a dead agent is detected too. It is inert unless the launch passes `--gho-agent=NAME`. Status files are runtime state of a running agent, kept in the worktree's ignored `.gho/` directory, not task state.
+- **A review is the unit of feedback.** `gho wait review` ends on a submitted review, so the implementer gets a whole batch of comments at once. Agents use the user's GitHub account, so their reviews are recognized by the `[agent:]` prefix. A cursor that the agent passes back, not local state, records which reviews were delivered. Without one, every review on the pull request counts, so a relaunched agent sees the whole history.
 - **Completed means `COMPLETED`.** Issues closed as not planned or duplicate never unblock dependents or complete notes.

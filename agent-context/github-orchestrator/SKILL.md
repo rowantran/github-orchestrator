@@ -24,6 +24,7 @@ Run `gho` inside the repository's checkout or one of its worktrees: it works on 
 - `gho workstream list --json`: list the repository's workstreams, including empty ones.
 - `gho workstream add NAME N...` / `gho workstream remove NAME N...`: add or remove memberships for existing issues without changing their other labels.
 - `gho dashboard [--port PORT] [--tmux-session NAME] [--tailscale-serve]`: serve the task graph on `127.0.0.1` and print its URL. By default, add `--tailscale-serve` to make the dashboard accessible over the Tailnet.
+- `gho wait agents [N | N/AGENT]... [--all] [--since CURSOR] [--timeout SECONDS]`: block until an agent you launched settles, then print JSON. Without arguments it watches every agent in every issue worktree. See "Wait for agents" below.
 
 ## Step 1: Plan
 
@@ -48,14 +49,24 @@ Once the plan is complete:
 
    ```sh
    pane=$(tmux new-window -P -F '#{pane_id}' -n "#N: <slug>" -c <worktree> \
-     'isara sandbox pi -- --model <implementer_model> --append-system-prompt "$(cat <skill dir>/implementer.md)" "$(cat <brief>)"') &&
+     'isara sandbox pi -- --gho-agent=implementer --model <implementer_model> --append-system-prompt "$(cat <skill dir>/implementer.md)" "$(cat <brief>)"') &&
    tmux set-option -p -t "$pane" @gho_repo '<owner/repo>' &&
    tmux set-option -p -t "$pane" @gho_issue 'N'
    ```
+
+   `--gho-agent=implementer` makes the agent record its activity in `<worktree>/.gho/agents/implementer.json`, which `gho wait agents` reads. Keep it on every launch.
 
    Use absolute paths. Do not pass the path of `implementer.md` or the brief directly: if Pi cannot read the file, it silently uses the path itself as the prompt text.
 
    Replace `<owner/repo>` with `repo` from `gho config` and `N` with the numeric issue number. Set both pane options on every launch, including reviewers and relaunches. The dashboard uses these tags together to associate existing panes with tasks.
 
-5. Watch progress for all active implementers. Answer other questions, steer (`tmux send-keys -t <window> '<message>' Enter`), stop, or relaunch as needed. Bubble up to the user for information when facing ambiguity that you can't safely resolve on your own. The user reviews the pseudocode skeleton in comments on the implementer's draft PR. When an implementer opens that PR, give the user its URL. Do NOT approve the skeleton yourself, and do not comment on the PR: the implementer uses the same GitHub account as the user, and treats every comment without the `[agent:]` prefix as a comment from the user.
-6. When an implementer publishes its PR, launch a reviewer in the same worktree the same way, but with `--model <reviewer_model>`, `reviewer.md`, and "Review " prepended to the window title.
+5. Watch progress for all active implementers with `gho wait agents` (see "Wait for agents" below). Answer other questions, steer (`tmux send-keys -t <window> '<message>' Enter`), stop, or relaunch as needed. Bubble up to the user for information when facing ambiguity that you can't safely resolve on your own. The user reviews the pseudocode skeleton in comments on the implementer's draft PR. When an implementer opens that PR, give the user its URL. Do NOT approve the skeleton yourself, and do not comment on the PR: the implementer uses the same GitHub account as the user, and treats every comment without the `[agent:]` prefix as a comment from the user.
+6. When an implementer publishes its PR (`gho ready --all` shows the issue as `ready_for_review`), launch a reviewer in the same worktree the same way, but with `--gho-agent=reviewer`, `--model <reviewer_model>`, `reviewer.md`, and "Review " prepended to the window title.
+
+## Wait for agents
+
+`gho wait agents [--since <cursor>]` exits when an agent you launched settles: it finishes its run and waits for a message, waits for an answer to a dialog in its terminal, quits, or crashes. Run it as a background shell command that wakes you when it exits (in Pi: `background_start` with `kind: "shell"`). It returns JSON.
+
+The JSON includes a `cursor`. Pass it as `--since <cursor>` every time you wait again; otherwise agents that are still settled end the wait again.
+
+By default it watches every agent in every issue worktree. To watch only some, pass `N` (the agents in issue N's worktree) or `N/AGENT` (one agent, such as `42/reviewer`).

@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::domain::{Issue, IssueRef, IssueState, PullRequest, PullRequestState, StateReason, validate_repo};
 use crate::process::{Cmd, Runner};
+use crate::reviews::{PullRequestReviews, PullRequestStatus, Review, ReviewComment};
 use crate::workstreams;
 use crate::{Error, Result, ensure};
 
@@ -970,6 +971,25 @@ impl<'a> GitHub<'a> {
                 "Created {url}, but setup is incomplete: {error}. Repair this issue; do not recreate it."
             ))
         })
+    }
+}
+
+impl PullRequestReviews for GitHub<'_> {
+    fn pull_request_status(&self, number: u64) -> Result<PullRequestStatus> {
+        let value = self.api(&format!("repos/{}/pulls/{number}", self.repo), &[])?;
+        let status: PullRequestStatus = parse(value, "pull request (check repository access)")?;
+        check!(status.number == number, "pull request number");
+        Ok(status)
+    }
+
+    fn reviews(&self, number: u64) -> Result<Vec<Review>> {
+        let endpoint = format!("repos/{}/pulls/{number}/reviews?per_page=100", self.repo);
+        self.rest_pages(&endpoint)?.into_iter().map(|value| parse(value, "pull request review")).collect()
+    }
+
+    fn review_comments(&self, number: u64) -> Result<Vec<ReviewComment>> {
+        let endpoint = format!("repos/{}/pulls/{number}/comments?per_page=100", self.repo);
+        self.rest_pages(&endpoint)?.into_iter().map(|value| parse(value, "pull request review comment")).collect()
     }
 }
 
