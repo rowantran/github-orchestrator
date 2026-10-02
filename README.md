@@ -50,11 +50,11 @@ You configure `gho` by editing two files. `gho init` takes no options. It create
   base_branch = "main"
   ```
 
-The repository and checkout are not configured: `gho` uses the git checkout you run it in (any worktree or subdirectory of it) and the GitHub repository of its `origin`. Unknown keys are an error. `gho doctor` checks that you can read the Project and warns when an agent model is not set. `gho config` prints the loaded config as JSON.
+The repository and checkout are not configured: `gho` uses the git checkout you run it in (any worktree or subdirectory of it) and the GitHub repository of its `origin`. Unknown keys are an error. `gho doctor` checks that you can read the Project, warns when an agent model is not set, and warns when the installed `gho` is not the latest version. `gho config` prints the loaded config as JSON.
 
 Use another config directory with `GHO_CONFIG_DIR` or `gho --config-dir PATH`. Worktrees go wherever your Worktrunk configuration puts them.
 
-To update later: rerun the `cargo install` command and `pi update git:github.com/rowantran/github-orchestrator`.
+To update later: rerun the `cargo install` command and `pi update git:github.com/rowantran/github-orchestrator`. `gho doctor` tells you when to: every commit on `main` is a new version, and it compares the commit that `gho` was built from with the tip of `main` on GitHub (`git ls-remote`, no credentials needed).
 
 ## Use it through the orchestrator
 

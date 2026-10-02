@@ -15,6 +15,7 @@ pub mod process;
 pub mod reviews;
 pub mod tailscale;
 pub mod tmux;
+pub mod version;
 pub mod wait;
 pub mod work;
 pub mod workspace;
