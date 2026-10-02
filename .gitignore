@@ -1,4 +1,7 @@
 /target/
+/dist/
+/playwright-report/
+/test-results/
 node_modules/
 .pi/
 .DS_Store

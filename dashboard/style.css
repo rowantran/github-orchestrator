@@ -13,7 +13,7 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; font-size: 14px; line-height: 1.5; }
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 button, select { cursor: pointer; }
 button { color: inherit; }
 button:disabled { opacity: .5; cursor: not-allowed; }
@@ -197,4 +197,40 @@ input[type="checkbox"] { accent-color: var(--accent); width: 14px; height: 14px;
   .graph-footer { font-size: 9px; gap: 12px; }
   #edge-count { white-space: normal; text-align: right; }
 }
+/* Execution controls are enabled only by the TypeScript server's HTML marker. */
+.orchestration .detail-panel { width: 480px; flex-basis: 480px; }
+.orchestration .workspace { min-height: 480px; height: calc(100dvh - 365px); }
+.runtime-status { color: #416a6b; background: #f0f8f7; border-color: #c7e1df; font-size: 11px; }
+.run-list-section { margin-top: 0; }
+#run-list { margin-top: 12px; display: grid; gap: 8px; }
+#run-list p { font-size: 12px; }
+.run-list-item { display: flex; gap: 8px; align-items: center; justify-content: space-between; padding: 8px; border: 1px solid var(--line); border-radius: 5px; background: white; font-size: 11px; text-align: left; }
+.run-phase { color: #3269af; font-size: 12px; }
+.phase-awaiting_approval, .phase-paused, .phase-blocked { color: #9d5e16; }
+.phase-done, .phase-ready_to_merge { color: #3f7952; }
+.phase-closed { color: var(--muted); }
+.run-phase-small { color: var(--accent-dark); font-size: 9px; font-weight: 600; }
+.run-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+#run-summary > p { margin: 7px 0; }
+#run-summary .field-label { margin-top: 10px; }
+.skeleton-sha, .approved-sha { display: block; overflow-wrap: anywhere; font-family: ui-monospace, monospace; font-size: 11px; margin: 5px 0 9px; }
+.run-error, .action-result.failure { color: #973b2a; white-space: pre-wrap; overflow-wrap: anywhere; }
+.action-result { color: var(--accent-dark); margin: 10px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-panel { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 16px; }
+.agent-session { color: var(--muted); font-size: 10px !important; overflow-wrap: anywhere; margin: 5px 0 12px; }
+.agent-transcript { max-height: 420px; min-height: 60px; overflow: auto; border: 1px solid var(--line); border-radius: 7px; padding: 10px; background: #f8fafb; overscroll-behavior: contain; }
+.agent-entry + .agent-entry { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.agent-entry h4 { margin: 0 0 5px; font-size: 11px; text-transform: capitalize; color: var(--accent-dark); }
+.agent-entry pre { margin: 7px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.65 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.agent-entry summary { cursor: pointer; font-size: 11px; color: #536b7a; }
+.streaming-output { border-left: 2px solid var(--accent); padding-left: 8px; }
+.agent-composer { margin-top: 14px; }
+.agent-composer textarea, .agent-dialog textarea { width: 100%; min-height: 78px; resize: vertical; border: 1px solid #c4d4da; border-radius: 6px; padding: 9px; font-size: 12px; }
+.agent-composer button { margin: 8px 0; }
+.agent-dialog { background: #fff9e9; border: 1px solid #eadbb4; border-radius: 6px; padding: 10px; margin-top: 12px; }
+.agent-dialog h4 { font-size: 12px; margin: 0 0 8px; }
+.agent-dialog button { margin: 8px 6px 0 0; }
+@media (max-width: 1250px) { .orchestration .detail-panel { width: 410px; flex-basis: 410px; } }
+@media (max-width: 1050px) { .orchestration .detail-panel { width: min(510px, 94vw); } }
+@media (max-width: 760px) { .run-list-section { grid-column: 1 / -1; } #run-list { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

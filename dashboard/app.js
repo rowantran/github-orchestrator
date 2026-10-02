@@ -233,6 +233,47 @@ function statusBadge(state) {
   return badge;
 }
 
+export const PHASES = Object.freeze({
+  queued: "Queued", planning: "Planning", awaiting_approval: "Awaiting approval",
+  implementing: "Implementing", reviewing: "Reviewing", ready_to_merge: "Ready to merge",
+  paused: "Paused", blocked: "Blocked", done: "Complete", closed: "Closed",
+});
+
+/** Render Pi message content as inert text. Tool arguments/results stay inspectable. */
+export function piContent(value) {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(piContent).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return "";
+  if (value.type === "image") return "[Image omitted; open the Pi session to inspect it.]";
+  if (value.type === "toolCall") return `${text(value.name) || "Tool"}\n${JSON.stringify(value.arguments ?? {}, null, 2)}`;
+  if (typeof value.text === "string") return value.text;
+  if (typeof value.thinking === "string") return value.thinking;
+  if (value.content !== undefined) return piContent(value.content);
+  return JSON.stringify(value, null, 2);
+}
+
+/** Only the newest unfinished streamed message/tool output supplements the message history. */
+export function liveAgentOutput(events) {
+  let assistant = "";
+  const tools = new Map();
+  for (const wrapped of list(events)) {
+    const event = wrapped?.event && typeof wrapped.event === "object" ? wrapped.event : wrapped;
+    if (!event) continue;
+    if (event.type === "message_start") assistant = "";
+    if (event.type === "message_update") {
+      const update = event.assistantMessageEvent;
+      if (event.message) assistant = piContent(event.message.content);
+      else if (update?.partial) assistant = piContent(update.partial.content);
+      else if (update?.type === "text_delta") assistant += text(update.delta);
+    }
+    if (event.type === "message_end" || event.type === "agent_end") assistant = "";
+    if (event.type === "tool_execution_start") tools.set(event.toolCallId, { name: event.toolName, output: piContent(event.args), running: true });
+    if (event.type === "tool_execution_update") tools.set(event.toolCallId, { name: event.toolName, output: piContent(event.partialResult), running: true });
+    if (event.type === "tool_execution_end") tools.set(event.toolCallId, { name: event.toolName, output: piContent(event.result), running: false, error: event.isError });
+  }
+  return { assistant, tools: [...tools.values()].slice(-20) };
+}
+
 export function startDashboard() {
   const $ = (id) => document.getElementById(id);
   const state = {
@@ -242,6 +283,13 @@ export function startDashboard() {
   const viewport = $("graph-viewport"), stage = $("graph-stage"), detail = $("detail-panel");
   const token = document.querySelector('meta[name="gho-token"]')?.content || "";
   let resizeTimer;
+  const orchestration = document.querySelector('meta[name="gho-orchestration"]')?.content === "enabled";
+  const live = { runs: new Map(), loaded: false, role: "implementer", timer: null, polling: false, pending: false, view: null, panelIssue: null, panel: null, runSignature: "", viewSignature: "", listSignature: "", drafts: new Map() };
+  if (orchestration) {
+    document.body.classList.add("orchestration");
+    $("run-list-section").hidden = false;
+    $("runtime-status").hidden = false;
+  }
 
   async function api(path, options = {}) {
     const response = await fetch(path, {
@@ -367,6 +415,13 @@ export function startDashboard() {
       else if (prs.length) bits.push(`${prs.length} PR${prs.length === 1 ? "" : "s"}`);
       footer.append(element("span", "", bits.join(" · ")));
       if (list(task.panes).length) { const pane = element("span", "pane-indicator", "▣"); pane.title = "Task pane available"; footer.append(pane); }
+      if (orchestration) {
+        const phase = element("span", "run-phase-small");
+        phase.dataset.runIssue = task.number;
+        const run = live.runs.get(task.number);
+        phase.textContent = run ? PHASES[run.phase] || run.phase : "";
+        footer.append(phase);
+      }
       button.append(top, title, footer);
       button.addEventListener("click", () => selectTask(task.number));
       button.addEventListener("focus", () => revealNode(task.number));
@@ -409,6 +464,8 @@ export function startDashboard() {
   function closeDetail(restoreFocus = true) {
     const previous = state.selected;
     state.selected = null;
+    live.panelIssue = null;
+    live.panel = null;
     detail.hidden = true;
     $("workspace").classList.remove("has-detail");
     renderSelection();
@@ -428,6 +485,7 @@ export function startDashboard() {
     state.selected = number;
     renderSelection();
     renderDetail();
+    if (orchestration) pollLocal();
     revealNode(number);
     $("detail-title").focus({ preventScroll: true });
   }
@@ -452,6 +510,7 @@ export function startDashboard() {
       groups.append(...task.workstreams.map((name) => element("span", "group-tag", name)));
       content.push(groups);
     }
+    if (orchestration) content.push(runPanel(task));
     const focus = detailSection("Local task pane");
     const panes = list(task.panes);
     if (panes.length) {
@@ -473,7 +532,8 @@ export function startDashboard() {
     const help = element("p", "filter-help", panes.length ? "Selects this task’s window and pane in tmux. Clients attached to that session show it. It does not start or run commands." : state.snapshot.tmux_warning ? `Pane discovery is unavailable: ${state.snapshot.tmux_warning}` : task.worktree ? "No tmux pane is open in this task’s worktree." : "This task has no local worktree or available tmux pane.");
     help.id = "focus-help";
     const result = element("p", "focus-result"); result.id = "focus-result"; result.setAttribute("role", "status");
-    focus.append(help, result); content.push(focus);
+    focus.append(help, result);
+    if (!orchestration) content.push(focus);
     const prs = detailSection("Pull requests");
     if (!list(task.pull_requests).length) prs.append(element("p", "muted", "No pull requests."));
     for (const pr of list(task.pull_requests)) {
@@ -506,10 +566,256 @@ export function startDashboard() {
     content.push(description);
     const local = detailSection("Working copy");
     const fields = element("dl", "local-fields");
-    fields.append(element("dt", "", "Branch"), element("dd", "", task.branch || "Not created"), element("dt", "", "Worktree"), element("dd", "", task.worktree || "Not created"));
+    const run = live.runs.get(task.number);
+    fields.append(element("dt", "", "Branch"), element("dd", "", run?.branch || task.branch || "Not created"), element("dt", "", "Worktree"), element("dd", "", run?.worktree || task.worktree || "Not created"));
     if (list(task.stack_on).length) fields.append(element("dt", "", "Stack on"), element("dd", "", task.stack_on.map((number) => `#${number}`).join(" → ")));
     local.append(fields); content.push(local);
     detail.replaceChildren(...content);
+  }
+
+  function runPanel(task) {
+    if (live.panelIssue === task.number && live.panel) return live.panel;
+    live.panelIssue = task.number;
+    live.runSignature = "";
+    live.viewSignature = "";
+    live.view = null;
+    const panel = detailSection("Task execution");
+    panel.id = "run-panel";
+    const summary = element("div"); summary.id = "run-summary";
+    const feedback = element("p", "action-result"); feedback.id = "run-action-result"; feedback.setAttribute("role", "status");
+    const agents = element("section", "agent-panel");
+    const label = element("label", "field-label", "Agent conversation"); label.htmlFor = "agent-role";
+    const role = element("select"); role.id = "agent-role";
+    for (const [value, name] of [["implementer", "Implementer · planning and implementation"], ["reviewer", "Reviewer"]]) {
+      const option = element("option", "", name); option.value = value; role.append(option);
+    }
+    role.value = live.role;
+    role.addEventListener("change", () => {
+      live.role = role.value; live.view = null; live.viewSignature = "";
+      $("agent-message").value = live.drafts.get(`${task.number}/${live.role}`) || "";
+      renderAgent(); pollLocal();
+    });
+    const status = element("p", "muted"); status.id = "agent-status";
+    const session = element("p", "agent-session"); session.id = "agent-session";
+    const transcript = element("div", "agent-transcript"); transcript.id = "agent-transcript";
+    transcript.setAttribute("aria-label", "Agent transcript");
+    const dialogs = element("div", "agent-dialogs"); dialogs.id = "agent-dialogs";
+    const form = element("form", "agent-composer");
+    const messageLabel = element("label", "field-label", "Message or nudge this agent"); messageLabel.htmlFor = "agent-message";
+    const input = element("textarea"); input.id = "agent-message"; input.rows = 3; input.maxLength = 16000;
+    input.placeholder = "Ask a question or steer the current work…";
+    input.value = live.drafts.get(`${task.number}/${live.role}`) || "";
+    input.addEventListener("input", () => live.drafts.set(`${task.number}/${live.role}`, input.value));
+    const send = element("button", "button primary", "Send message"); send.type = "submit"; send.id = "send-agent-message";
+    form.append(messageLabel, input, send, element("p", "filter-help", "Messages stay in this Pi session. Active work receives a steering message; otherwise the service queues feedback. Messages do not approve a skeleton or resume paused work."));
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      const value = input.value;
+      const selectedRole = live.role;
+      if (!value.trim()) return;
+      const sent = await runAction(task.number, `agents/${selectedRole}/messages`, { text: value }, "Message sent.");
+      if (sent) {
+        if (live.drafts.get(`${task.number}/${selectedRole}`) === value) live.drafts.delete(`${task.number}/${selectedRole}`);
+        if (live.panelIssue === task.number && live.role === selectedRole && input.value === value) input.value = "";
+      }
+    });
+    agents.append(label, role, status, session, transcript, dialogs, form);
+    panel.append(summary, feedback, agents);
+    live.panel = panel;
+    // The panel is not mounted until renderDetail finishes.
+    queueMicrotask(() => { if (live.panel === panel) { renderRun(); renderAgent(); } });
+    return panel;
+  }
+
+  function actionButton(label, action, body = {}, primary = false) {
+    const button = element("button", `button ${primary ? "primary" : "secondary"}`, label);
+    button.type = "button"; button.disabled = live.pending;
+    button.addEventListener("click", () => runAction(state.selected, action, typeof body === "function" ? body() : body));
+    return button;
+  }
+
+  function renderRun() {
+    if (!$("run-summary")) return;
+    const run = live.runs.get(state.selected);
+    const signature = JSON.stringify([run, live.loaded, live.pending]);
+    if (signature === live.runSignature) return;
+    live.runSignature = signature;
+    const summary = $("run-summary");
+    if (!live.loaded) { summary.replaceChildren(element("p", "muted", "Loading local execution state…")); return; }
+    if (!run) {
+      const label = element("label", "field-label", "Execution mode"); label.htmlFor = "run-mode";
+      const mode = element("select"); mode.id = "run-mode";
+      for (const [value, label] of [["supervised", "Supervised · approve the skeleton first"], ["unsupervised", "Unsupervised · implement without approval"]]) {
+        const option = element("option", "", label); option.value = value; mode.append(option);
+      }
+      const start = actionButton("Start task", "start", () => ({ mode: mode.value }), true); start.id = "start-task";
+      const task = state.snapshot?.tasks.find(item => item.number === state.selected);
+      start.disabled ||= task?.state !== "ready";
+      summary.replaceChildren(label, mode, start, element("p", "filter-help", task?.state === "ready" ? "Supervised mode stops at a committed skeleton. You approve its exact commit before implementation. Both phases use the same implementer session." : "Only ready tasks can start. Complete the blockers and refresh the graph first."));
+    } else {
+      const phase = element("strong", `run-phase phase-${run.phase}`, PHASES[run.phase] || run.phase); phase.id = "run-phase";
+      const info = element("p", "muted", `${run.mode === "unsupervised" ? "Unsupervised" : "Supervised"} · Updated ${new Date(run.updatedAt).toLocaleTimeString()}`);
+      const nodes = [phase, info];
+      if (run.error) { const error = element("p", "run-error", run.error); error.setAttribute("role", "alert"); nodes.push(error); }
+      if (run.feedback) nodes.push(element("p", "issue-body", run.feedback));
+      if (run.prUrl) nodes.push(externalLink("Open pull request ↗", run.prUrl));
+      if (run.skeletonSha) {
+        const sha = element("code", "skeleton-sha", run.skeletonSha); sha.id = "skeleton-sha";
+        nodes.push(element("p", "field-label", "Skeleton commit"), sha);
+      }
+      if (run.approvedSha) nodes.push(element("p", "approved-sha", `Approved commit: ${run.approvedSha}`));
+      const buttons = element("div", "run-actions");
+      if (run.phase === "awaiting_approval" && run.skeletonSha) {
+        // Capture the displayed full SHA. A concurrent skeleton change must be rejected by the service.
+        const approve = actionButton("Approve this skeleton", "approve", { sha: run.skeletonSha }, true); approve.id = "approve-skeleton";
+        buttons.append(approve);
+        nodes.push(element("p", "filter-help", "Review this commit in the pull request. Approval applies only to the SHA above, not to a later revision."));
+      }
+      if (["paused", "blocked"].includes(run.phase)) { const resume = actionButton("Resume task", "resume"); resume.id = "resume-task"; buttons.append(resume); }
+      else if (!["done", "closed"].includes(run.phase)) { const pause = actionButton("Pause task", "pause"); pause.id = "pause-task"; buttons.append(pause); }
+      nodes.push(buttons);
+      summary.replaceChildren(...nodes);
+    }
+    const agent = run?.agents?.[live.role];
+    if ($("send-agent-message")) $("send-agent-message").disabled = live.pending || !agent?.sessionId || ["done", "closed"].includes(run?.phase);
+  }
+
+  function renderAgent() {
+    if (!$("agent-transcript")) return;
+    const run = live.runs.get(state.selected), record = run?.agents?.[live.role];
+    $("agent-status").textContent = `${live.role === "implementer" ? "Implementer" : "Reviewer"}: ${live.view?.status || record?.status || "not started"}${record?.model ? ` · ${record.model}` : ""}`;
+    $("agent-session").textContent = record?.sessionId ? `Session ${record.sessionId}${live.role === "implementer" ? " · shared by planning and implementation" : ""}` : "The conversation appears when this agent starts.";
+    $("send-agent-message").disabled = live.pending || !record?.sessionId || ["done", "closed"].includes(run?.phase);
+    const signature = JSON.stringify([state.selected, live.role, live.view]);
+    if (signature === live.viewSignature) return;
+    live.viewSignature = signature;
+    const transcript = $("agent-transcript");
+    const atBottom = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 40;
+    const open = new Set([...transcript.querySelectorAll("details[open]")].map(item => item.dataset.entry));
+    const entries = [];
+    const messages = Array.isArray(live.view?.messages) ? live.view.messages : list(live.view?.messages?.messages);
+    for (const [index, message] of messages.entries()) {
+      if (!message || typeof message !== "object") continue;
+      const tool = message.role === "toolResult" || message.role === "tool";
+      const article = element(tool ? "details" : "article", `agent-entry${tool ? " tool-output" : ""}`);
+      article.dataset.entry = `message-${index}`;
+      if (tool) article.open = open.has(article.dataset.entry);
+      article.append(element(tool ? "summary" : "h4", "agent-entry-label", `${tool ? `Tool: ${text(message.toolName) || "result"}` : text(message.role) || "Message"}${message.isError ? " · failed" : ""}`));
+      article.append(element("pre", "", piContent(message.content)));
+      entries.push(article);
+    }
+    const streaming = liveAgentOutput(live.view?.events);
+    if (streaming.assistant) {
+      const entry = element("article", "agent-entry streaming-output");
+      entry.append(element("h4", "agent-entry-label", "Assistant · streaming"), element("pre", "", streaming.assistant)); entries.push(entry);
+    }
+    for (const [index, tool] of streaming.tools.entries()) {
+      const entry = element("details", "agent-entry tool-output live-tool"); entry.dataset.entry = `tool-${index}`;
+      entry.open = tool.running || open.has(entry.dataset.entry);
+      entry.append(element("summary", "", `${tool.name || "Tool"} · ${tool.running ? "running" : tool.error ? "failed" : "finished"}`), element("pre", "", tool.output)); entries.push(entry);
+    }
+    if (!entries.length) entries.push(element("p", "muted", "No messages yet."));
+    if (list(live.view?.events).length) {
+      const raw = element("details", "agent-entry raw-events"); raw.dataset.entry = "events"; raw.open = open.has("events");
+      raw.append(element("summary", "", "Recent RPC events"), element("pre", "", JSON.stringify(live.view.events.slice(-100), null, 2))); entries.push(raw);
+    }
+    transcript.replaceChildren(...entries);
+    if (atBottom) transcript.scrollTop = transcript.scrollHeight;
+    renderDialogs(list(live.view?.dialogs));
+  }
+
+  function renderDialogs(dialogs) {
+    const container = $("agent-dialogs");
+    const signature = JSON.stringify(dialogs);
+    if (container.dataset.signature === signature) return;
+    container.dataset.signature = signature;
+    container.replaceChildren(...dialogs.map(dialog => {
+      const form = element("form", "agent-dialog"); form.dataset.dialogId = dialog.id;
+      form.append(element("h4", "", text(dialog.title) || "Agent needs a response"));
+      if (dialog.message) form.append(element("p", "issue-body", dialog.message));
+      const method = dialog.method;
+      let input;
+      if (["input", "editor", "select"].includes(method)) {
+        input = element(method === "select" ? "select" : "textarea");
+        input.setAttribute("aria-label", text(dialog.title) || "Dialog response");
+        if (method === "select") for (const option of list(dialog.options)) { const node = element("option", "", option); node.value = option; input.append(node); }
+        else { input.value = text(dialog.prefill) || text(dialog.value); input.placeholder = text(dialog.placeholder); input.maxLength = 16000; }
+        form.append(input);
+      }
+      const issue = state.selected, role = live.role;
+      if (input || method === "confirm") {
+        const submit = element("button", "button primary", method === "confirm" ? "Confirm" : "Send response"); submit.type = "submit"; form.append(submit);
+        form.addEventListener("submit", event => { event.preventDefault(); runAction(issue, `agents/${role}/responses`, input ? { id: dialog.id, value: input.value } : { id: dialog.id, confirmed: true }, "Response sent."); });
+      } else form.append(element("p", "muted", "This dialog type is not supported here. Cancel it and ask the agent for another way to continue."));
+      const cancel = element("button", "button secondary", method === "confirm" ? "Decline" : "Cancel dialog"); cancel.type = "button";
+      cancel.addEventListener("click", () => runAction(issue, `agents/${role}/responses`, method === "confirm" ? { id: dialog.id, confirmed: false } : { id: dialog.id, cancelled: true }, "Response sent."));
+      form.append(cancel); return form;
+    }));
+  }
+
+  async function runAction(issue, path, body, message = "Task updated.") {
+    if (live.pending || !Number.isSafeInteger(issue)) return false;
+    live.pending = true;
+    const feedback = $("run-action-result");
+    if (feedback) { feedback.textContent = "Sending…"; feedback.classList.remove("failure"); }
+    renderRun(); renderAgent();
+    try {
+      await api(`/api/runs/${issue}/${path}`, { method: "POST", body: JSON.stringify(body) });
+      if (state.selected === issue && $("run-action-result")) $("run-action-result").textContent = message;
+      return true;
+    } catch (error) {
+      if (state.selected === issue && $("run-action-result")) { $("run-action-result").textContent = error.message; $("run-action-result").classList.add("failure"); }
+      return false;
+    } finally {
+      live.pending = false; live.runSignature = "";
+      renderRun(); renderAgent(); pollLocal();
+    }
+  }
+
+  function renderRunList() {
+    const signature = JSON.stringify([[...live.runs.values()].map(run => [run.issue, run.phase]), state.snapshot?.tasks.map(task => task.number)]);
+    if (signature === live.listSignature) return;
+    live.listSignature = signature;
+    const rows = [...live.runs.values()].sort((a, b) => a.issue - b.issue).map(run => {
+      const button = element("button", "run-list-item"); button.type = "button";
+      button.append(element("span", "", `#${run.issue}`), element("span", `run-phase phase-${run.phase}`, PHASES[run.phase] || run.phase));
+      button.disabled = !state.snapshot?.tasks.some(task => task.number === run.issue);
+      button.addEventListener("click", () => {
+        state.group = ""; state.query = ""; $("task-search").value = "";
+        const url = new URL(location.href); url.searchParams.delete("group"); history.replaceState(null, "", url);
+        renderGroups(); renderGraph(); selectTask(run.issue);
+      });
+      return button;
+    });
+    $("run-list").replaceChildren(...(rows.length ? rows : [element("p", "muted", "No local runs. Select a ready task to start.")]));
+    for (const badge of document.querySelectorAll("[data-run-issue]")) {
+      const run = live.runs.get(Number(badge.dataset.runIssue));
+      badge.textContent = run ? PHASES[run.phase] || run.phase : "";
+    }
+  }
+
+  async function pollLocal() {
+    if (!orchestration || live.polling || document.hidden) return;
+    clearTimeout(live.timer); live.polling = true;
+    try {
+      const runs = await api("/api/runs");
+      if (!Array.isArray(runs) || runs.some(run => !Number.isSafeInteger(run?.issue) || !Object.hasOwn(PHASES, run.phase))) throw new Error("The server returned invalid local run state.");
+      live.runs = new Map(runs.map(run => [run.issue, run])); live.loaded = true;
+      renderRunList(); renderRun();
+      const issue = state.selected, role = live.role;
+      if (issue && live.runs.has(issue)) {
+        const view = await api(`/api/runs/${issue}/agents/${role}`);
+        if (state.selected === issue && live.role === role) { live.view = view; renderAgent(); }
+      } else { live.view = null; renderAgent(); }
+      $("runtime-status").textContent = "Live execution · local state updates every 1.5s. GitHub graph refresh is separate.";
+      $("runtime-status").classList.remove("warning-banner");
+    } catch (error) {
+      $("runtime-status").textContent = `Live updates unavailable: ${error.message} Last local state is retained; retrying.`;
+      $("runtime-status").classList.add("warning-banner");
+    } finally {
+      live.polling = false;
+      if (!document.hidden) live.timer = setTimeout(pollLocal, 1500);
+    }
   }
 
   async function focusPane(issue) {
@@ -611,7 +917,11 @@ export function startDashboard() {
   $("task-search").addEventListener("input", (event) => { state.query = event.target.value; renderGraph(true); });
   $("refresh-button").addEventListener("click", () => refresh());
   $("auto-refresh").addEventListener("change", scheduleRefresh);
-  document.addEventListener("visibilitychange", scheduleRefresh);
+  document.addEventListener("visibilitychange", () => {
+    scheduleRefresh();
+    clearTimeout(live.timer);
+    if (!document.hidden) pollLocal();
+  });
   $("zoom-in").addEventListener("click", () => zoom(1.2));
   $("zoom-out").addEventListener("click", () => zoom(1 / 1.2));
   $("fit-graph").addEventListener("click", () => fitGraph());
@@ -640,6 +950,7 @@ export function startDashboard() {
   window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => fitGraph(true), 150); });
   renderLegend([]);
   refresh();
+  pollLocal();
 }
 
 if (typeof document !== "undefined") startDashboard();

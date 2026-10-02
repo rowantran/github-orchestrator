@@ -15,6 +15,25 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       # Worktrunk (wt) is not installed here, so its integration tests skip themselves.
       - run: cargo test --locked
+  orchestration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm install --global @earendil-works/pi-coding-agent@0.99.2
+      - run: npm test
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: orchestration-browser-results
+          path: tests/orchestration-browser/test-results/
+          retention-days: 7
   typescript:
     runs-on: ubuntu-latest
     defaults:
