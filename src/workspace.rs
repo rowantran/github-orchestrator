@@ -97,6 +97,13 @@ impl<'a> Workspace<'a> {
         }
     }
 
+    /// The branch checked out in the checkout gho runs in.
+    pub fn current_branch(&self) -> Result<String> {
+        let branch = self.git(&["rev-parse", "--abbrev-ref", "HEAD"], 60)?;
+        ensure!(branch != "HEAD", "{} has no branch checked out (detached HEAD).", self.config.checkout.display());
+        Ok(branch)
+    }
+
     /// Branch name → worktree path, for every worktree of the checkout.
     pub fn worktrees(&self) -> Result<BTreeMap<String, String>> {
         let mut result = BTreeMap::new();
