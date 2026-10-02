@@ -75,24 +75,14 @@ After that, continue to wait for reviews on the pull request. Address new commen
 
 ## Wait for reviews
 
-The user writes comments in a pending review and submits them together, so each review is one batch of comments. Do not poll GitHub yourself. Run `gho wait review` in this worktree as a background shell command that wakes you when it exits (in Pi: `background_start` with `kind: "shell"`). If you have no such tool, run it in the foreground.
+When you wait for a review from the user, run `gho wait review [--since <cursor>]` in this worktree as a background shell command that wakes you when it exits (in Pi: `background_start` with `kind: "shell"`).
 
-`gho wait review` finds the open pull request from your branch (or use `--pr N`). It ends when someone other than an agent submits a review, or when the pull request is merged or closed. It prints JSON:
+The command finds and watches the open pull request from your branch. It returns JSON.
 
-- `result`: `reviews`, `merged`, `closed`, or `timeout`.
-- `reviews`: each new review with its `body` and its inline `comments` (`id`, `path`, `line`, `in_reply_to`, `body`).
-- `cursor`: pass it to the next wait as `--since <cursor>`, so these reviews do not end that wait again. Always keep the latest cursor.
+The JSON includes a `cursor`. Pass it as `--since <cursor>` every time you wait again; otherwise the reviews you already handled end the wait again.
 
-After you address a batch, start the next wait with the new cursor. While the wait runs in the background, the user can still talk to you in this terminal. Stop waiting when the result is `merged` or `closed`.
+Stop waiting when the result is `merged` or `closed`. These states are final: no more reviews will come.
 
 ## Use the pull request for review
 
 **Prefix every comment that you write on GitHub with `[agent:]`**: pull request comments, replies to review comments, and review bodies. For example: `[agent:] Done in abc1234: the balance check now runs before the notification.` You use the same GitHub account as the user, so this prefix is the only way to tell your comments from theirs. Treat every comment without the prefix as a comment from the user, and ignore every comment with the prefix.
-
-Reply to an inline comment in its thread, with the comment `id` from `gho wait review`:
-
-```sh
-gh api repos/<owner>/<repo>/pulls/<PR number>/comments/<comment id>/replies -f body='[agent:] <reply>'
-```
-
-Answer a review's body with `gh pr comment <PR number> --body '[agent:] <reply>'`.

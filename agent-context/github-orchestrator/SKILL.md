@@ -9,7 +9,7 @@ metadata:
 <!-- Purpose: teach the orchestrator agent the gho workflow. Audience: orchestrator agent. Injection: Pi package skill, loaded when the task matches or via /skill:github-orchestrator. -->
 # Orchestrate nontrivial work with github-orchestrator (gho)
 
-`gho` registers work, lists ready work, creates worktrees, and waits for agents to settle.
+`gho` registers work, lists ready work, and creates worktrees.
 You decide the rest with the user: which tasks to create, how to launch and steer implementers, and when to publish.
 
 ## Commands
@@ -60,18 +60,13 @@ Once the plan is complete:
 
    Replace `<owner/repo>` with `repo` from `gho config` and `N` with the numeric issue number. Set both pane options on every launch, including reviewers and relaunches. The dashboard uses these tags together to associate existing panes with tasks.
 
-5. Watch progress for all active implementers with `gho wait agents` (see "Wait for agents" below), not by reading their windows in a loop. Answer other questions, steer (`tmux send-keys -t <window> '<message>' Enter`), stop, or relaunch as needed. Bubble up to the user for information when facing ambiguity that you can't safely resolve on your own. The user reviews the pseudocode skeleton in comments on the implementer's draft PR. When an implementer opens that PR, give the user its URL. Do NOT approve the skeleton yourself, and do not comment on the PR: the implementer uses the same GitHub account as the user, and treats every comment without the `[agent:]` prefix as a comment from the user.
+5. Watch progress for all active implementers with `gho wait agents` (see "Wait for agents" below). Answer other questions, steer (`tmux send-keys -t <window> '<message>' Enter`), stop, or relaunch as needed. Bubble up to the user for information when facing ambiguity that you can't safely resolve on your own. The user reviews the pseudocode skeleton in comments on the implementer's draft PR. When an implementer opens that PR, give the user its URL. Do NOT approve the skeleton yourself, and do not comment on the PR: the implementer uses the same GitHub account as the user, and treats every comment without the `[agent:]` prefix as a comment from the user.
 6. When an implementer publishes its PR (`gho ready --all` shows the issue as `ready_for_review`), launch a reviewer in the same worktree the same way, but with `--gho-agent=reviewer`, `--model <reviewer_model>`, `reviewer.md`, and "Review " prepended to the window title.
 
 ## Wait for agents
 
-`gho wait agents` blocks until an agent settles: it finishes its run and waits for a message, waits for an answer to a dialog in its terminal (`prompting`), quits (`exited`), or stops updating its status without quitting (`lost`, for example after a crash). Run it as a background shell command that wakes you when it exits (in Pi: `background_start` with `kind: "shell"`), so you use no context while nothing happens. If you have no such tool, run it in the foreground.
+`gho wait agents [--since <cursor>]` exits when an agent you launched settles: it finishes its run and waits for a message, waits for an answer to a dialog in its terminal, quits, or crashes. Run it as a background shell command that wakes you when it exits (in Pi: `background_start` with `kind: "shell"`). It returns JSON.
 
-It prints JSON:
+The JSON includes a `cursor`. Pass it as `--since <cursor>` every time you wait again; otherwise agents that are still settled end the wait again.
 
-- `agents`: every watched agent, with `id` (`N/AGENT`), `worktree`, `state`, `new` (settled since the cursor you passed), `last_message` (the end of its last message, when `settled`), and `session_file`.
-- `cursor`: pass it to the next wait as `--since <cursor>`, so agents that are still settled do not end that wait again.
-
-Handle the agents with `new: true`, then start the next wait with the new cursor. Keep one wait running while any agent is active. An implementer that waits for the user's PR review is settled, so its first settling after it opens the draft PR is your signal to give the user the PR URL.
-
-Arguments select agents: `42` watches every agent in issue 42's worktree, `42/reviewer` only its reviewer. `--all` ends the wait only when every watched agent is settled at the same time. `--timeout SECONDS` gives up with `"result": "timeout"`. Right after a launch, the agent may not have a status yet; `gho wait agents` waits up to 30 seconds for it, then fails with instructions.
+By default it watches every agent in every issue worktree. To watch only some, pass `N` (the agents in issue N's worktree) or `N/AGENT` (one agent, such as `42/reviewer`).
