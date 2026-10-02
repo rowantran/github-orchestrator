@@ -7,7 +7,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { Core, type Config } from './core/index.js';
 import { Orchestrator } from './engine.js';
 import { startServer, type DashboardServer, type ServiceAPI } from './http.js';
-import { PiAgent } from './rpc.js';
+import { createAgentFactory } from './agents/index.js';
 import { acquireLock, atomicJson, RunStore } from './store.js';
 
 const exec = promisify(execFile);
@@ -76,7 +76,8 @@ export async function serve(config: Config, options: ServiceOptions = {}): Promi
   const root = await runtimeDirectory(config.checkout);
   const unlock = await acquireLock(root);
   const settings = config.orchestration;
-  const engine = new Orchestrator(new Core(config), new RunStore(root), opts => new PiAgent(opts), {
+  const engine = new Orchestrator(new Core(config), new RunStore(root),
+    await createAgentFactory(config.agents.runtime, config.checkout, message => console.error(`gho service: ${message}`)), {
     concurrency: settings?.max_concurrency,
     pollMs: settings?.poll_interval_ms,
     runTimeoutMs: settings?.agent_timeout_ms,

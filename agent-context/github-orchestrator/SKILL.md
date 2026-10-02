@@ -41,7 +41,7 @@ gho pause 42
 gho resume 42
 gho wait agents --since '<cursor>'
 ```
-The dashboard shows agent messages, tool activity, and extension dialogs. A message is not approval. Messages to paused/blocked tasks are retained, but do not resume them. Use `resume` explicitly after resolving the blocker. The service is independent of your session; you can stop responding without stopping the tasks.
+The dashboard shows agent messages, tool activity, and extension dialogs (dialogs exist only for `agents.runtime = "rpc"` workers). A message is not approval. Messages to paused/blocked tasks are retained, but do not resume them. Use `resume` explicitly after resolving the blocker. The service is independent of your session; you can stop responding without stopping the tasks.
 
 ## Approval and merging
 Give the user the draft PR URL and full skeleton SHA. They can approve in the dashboard or write `/gho approve FULL_SHA` in a GitHub PR comment or submitted review.

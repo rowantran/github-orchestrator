@@ -1,10 +1,10 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
-import { existsSync } from "node:fs";
 import { access, mkdir, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { acquireLock, type OwnedLock } from "./store.js";
+import { acquireLock, type OwnedLock } from "../../store.js";
+import type { AgentOptions, WorkerAgent } from "../types.js";
 
 type RpcChild = ChildProcess & { stdin: Writable; stdout: Readable; stderr: Readable };
 
@@ -24,18 +24,14 @@ export interface PromptAcceptance { disposition: "started" | "queued" | "handled
 export type DialogResponse = { id: string; type?: "extension_ui_response" } & (
   { value: string } | { confirmed: boolean } | { cancelled: true }
 );
-export interface PiAgentOptions {
-  cwd: string;
-  sessionId: string;
-  sessionDir: string;
-  role: "implementer" | "reviewer";
-  model?: string;
+/** RPC-specific options on top of the shared dispatch inputs. */
+export interface PiAgentOptions extends Omit<AgentOptions, "instructionsPath"> {
+  /** Optional here so diagnostics and tests can start Pi without role instructions. */
+  instructionsPath?: string;
+  /** Pi executable; defaults to `pi` on PATH. */
   command?: string;
   /** Prefix arguments, for example a wrapper script, followed by Pi CLI options. */
   args?: string[];
-  instructionsPath?: string;
-  reportPath: string;
-  phaseToken: string;
   onEvent?: (event: RpcEvent) => void;
   startupTimeoutMs?: number;
   commandTimeoutMs?: number;
@@ -61,8 +57,8 @@ interface PendingDialog {
 }
 type Lifecycle = "new" | "starting" | "ready" | "closing" | "closed";
 const activeSessions = new Set<string>();
-const packageRoot = new URL(existsSync(new URL("../package.json", import.meta.url)) ? "../" : "../../", import.meta.url);
-const extensionPath = fileURLToPath(new URL("extensions/orchestration.mjs", packageRoot));
+/** Compiled next to this module; loaded explicitly into every RPC worker. */
+const extensionPath = fileURLToPath(new URL("./report-extension.js", import.meta.url));
 const thinkingLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const dialogs = new Set(["confirm", "select", "input", "editor"]);
 const reservedFlags = new Set([
@@ -80,7 +76,7 @@ function positive(value: number | undefined, fallback: number): number {
 }
 
 /** Owns one normal Pi CLI process, not its durable event journal or task state. */
-export class PiAgent {
+export class PiAgent implements WorkerAgent {
   readonly options: Readonly<PiAgentOptions>;
   private child: RpcChild | undefined;
   private writerLock: OwnedLock | undefined;

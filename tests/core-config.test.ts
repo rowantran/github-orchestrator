@@ -59,12 +59,16 @@ test('config defaults and path resolution preserve missing vault paths through s
   assert.equal(await resolvePath(join(f.checkout, 'alias/not-created/config')), join(f.root, 'not-created/config'));
   await writeFile(f.global, 'owner = "alice"\n[obsidian]\nvault = ""\n');
   assert.equal((await loadConfig(f.checkout, f.dir, f.runner)).vault, null);
+  for (const runtime of ['durable', 'rpc'] as const) {
+    await writeFile(f.global, `owner = "alice"\n[agents]\nruntime = "${runtime}"\n`);
+    assert.equal((await loadConfig(f.checkout, f.dir, f.runner)).agents.runtime, runtime);
+  }
 });
 
 test('config rejects invalid values and unknown keys at every supported table', async t => {
   const f = await fixture(t); await initConfig(f.checkout, f.dir, f.runner);
   const global = 'owner = "alice"\n', local = 'project_url = "https://github.com/users/alice/projects/1"\n';
-  for (const value of ['owner = "bad owner"', 'owner = 42', `${global}extra = true`, `${global}[agents]\nimplementer_model = "bad model"`, `${global}[agents]\nreviewer_model = 42`, `${global}[obsidian]\nvaul = "typo"`, `${global}[orchestration]\nmax_attempts = 0`, `${global}[orchestration]\npoll_interval_ms = 1.5`, `${global}[orchestration]\nmax_concurency = 3`]) {
+  for (const value of ['owner = "bad owner"', 'owner = 42', `${global}extra = true`, `${global}[agents]\nimplementer_model = "bad model"`, `${global}[agents]\nreviewer_model = 42`, `${global}[agents]\nruntime = "subprocess"`, `${global}[agents]\nruntime = true`, `${global}[obsidian]\nvaul = "typo"`, `${global}[orchestration]\nmax_attempts = 0`, `${global}[orchestration]\npoll_interval_ms = 1.5`, `${global}[orchestration]\nmax_concurency = 3`]) {
     await writeFile(f.global, value); await writeFile(f.local, local);
     await assert.rejects(loadConfig(f.checkout, f.dir, f.runner), value);
   }

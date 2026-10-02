@@ -5,7 +5,8 @@ import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { RunStore } from './store.js';
-import type { AgentFactory, Dispatch, ExecutionCore, Mode, Phase, PullRequestInfo, Report, Role, RpcAgent, Run, WorkPhase } from './types.js';
+import type { AgentFactory, WorkerAgent } from './agents/types.js';
+import type { Dispatch, ExecutionCore, Mode, Phase, PullRequestInfo, Report, Role, Run, WorkPhase } from './types.js';
 
 const exec = promisify(execFile);
 const resources = fileURLToPath(new URL('../../agent-context/runtime/', import.meta.url));
@@ -14,6 +15,14 @@ const terminalPhases = new Set<Phase>(['done', 'closed']);
 const roleFor = (phase: WorkPhase): Role => phase === 'reviewing' ? 'reviewer' : 'implementer';
 const messageText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 const clone = <T>(value: T): T => structuredClone(value);
+/** Stop an agent's current work before closing it. Pi Durable keeps unaborted work and would resume it. */
+async function abortWithin(agent: WorkerAgent, ms = 10_000): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  await Promise.race([
+    Promise.resolve().then(() => agent.abort()).catch(() => {}),
+    new Promise<void>(done => { timer = setTimeout(done, ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
 
 export interface EngineOptions {
   concurrency?: number;
@@ -21,12 +30,10 @@ export interface EngineOptions {
   maxReviewRounds?: number;
   pollMs?: number;
   runTimeoutMs?: number;
-  piCommand?: string;
-  piArgs?: string[];
   verifyHead?: (worktree: string, sha: string) => Promise<void>;
   onError?: (error: unknown) => void;
 }
-interface Active { agent: RpcAgent; dispatch: Dispatch; unsubscribe?: () => void; deadline?: NodeJS.Timeout; dialogs: Map<string, Record<string, unknown>>; }
+interface Active { agent: WorkerAgent; dispatch: Dispatch; unsubscribe?: () => void; deadline?: NodeJS.Timeout; dialogs: Map<string, Record<string, unknown>>; }
 
 /** Deterministic task execution; GitHub remains the source of task content and eligibility. */
 export class Orchestrator {
@@ -330,6 +337,7 @@ export class Orchestrator {
     const live = this.active.get(run.issue);
     if (live) {
       if (live.dispatch.startedAt && Date.now() - Date.parse(live.dispatch.startedAt) > (this.options.runTimeoutMs ?? 60 * 60_000)) {
+        await abortWithin(live.agent);
         await this.fail(run, new Error('Agent exceeded its run deadline; retry budget applies.'));
       }
       return;
@@ -429,14 +437,14 @@ export class Orchestrator {
     await this.persist(run);
     if (this.closing || this.pauseRequests.has(run.issue)) return;
     const agent = this.factory({ cwd: run.worktree, sessionId: run.agents[role].sessionId, sessionDir: join(run.worktree, '.gho', 'sessions'), role,
-      model, command: this.options.piCommand, args: this.options.piArgs, instructionsPath: join(resources, role === 'reviewer' ? 'reviewer.md' : 'worker.md'),
+      model, instructionsPath: join(resources, role === 'reviewer' ? 'reviewer.md' : 'worker.md'),
       reportPath: dispatch.reportPath, phaseToken: dispatch.id });
     const live: Active = { agent, dispatch: clone(dispatch), dialogs: new Map() };
     this.active.set(run.issue, live);
     live.deadline = setTimeout(() => {
       if (this.active.get(run.issue) !== live) return;
       // This timer must not wait behind a prompt's input hook in the serial lifecycle queue.
-      void live.agent.close().catch(error => this.options.onError?.(error)).finally(() => {
+      void abortWithin(live.agent).then(() => live.agent.close()).catch(error => this.options.onError?.(error)).finally(() => {
         void this.serial(async () => { if (this.active.get(run.issue) === live) await this.fail(run, new Error('Agent exceeded its run deadline.')); });
       });
     }, this.options.runTimeoutMs ?? 60 * 60_000);
@@ -449,7 +457,7 @@ export class Orchestrator {
       await this.persist(run);
       await this.reconcileMessages(run, agent, role);
       if (phase === 'implementing' && !run.implementationStarted) {
-        // A lost RPC acknowledgement is resolved from the saved user prompt, not from a launch attempt.
+        // A lost prompt acknowledgement is resolved from the saved user prompt, not from a launch attempt.
         const history = await agent.getMessages();
         const messages = Array.isArray(history) ? history : (history as { messages?: unknown[] })?.messages ?? [];
         const admitted = messages.some(message => (message as { role?: string }).role === 'user' && JSON.stringify(message).includes(dispatch.id));
@@ -459,6 +467,14 @@ export class Orchestrator {
           if (!current || current.state !== 'OPEN') throw new Error('Implementation requires an open PR.');
           await this.validateInitialImplementation(run, current);
         }
+      }
+      if (agent.resumedWork && (phase !== 'implementing' || run.implementationStarted)) {
+        // A durable conversation continues its interrupted turn by itself. Deliver queued nudges into that turn
+        // instead of starting another one; settlement and the phase report are handled as usual.
+        for (const message of run.pendingMessages?.filter(message => message.role === role) ?? []) {
+          await agent.steer(`${message.marker}\n${message.text}`);
+        }
+        return;
       }
       const task = await this.core.inspectTask(run.issue);
       const context = { task, repo: run.repo, branch: run.branch, baseBranch: run.baseBranch, phase, mode: run.mode, skeletonSha: run.skeletonSha,
@@ -518,7 +534,7 @@ export class Orchestrator {
       });
     } else if (event.type === 'process_exit' || event.type === 'exit' || event.type === 'driver_error') {
       void this.serial(async () => {
-        if (this.active.get(issue) === live) await this.fail(this.require(issue), new Error('Pi process exited before the phase settled.'));
+        if (this.active.get(issue) === live) await this.fail(this.require(issue), new Error('Agent stopped before the phase settled.'));
       });
     }
   }
@@ -606,7 +622,7 @@ export class Orchestrator {
     run.phase = 'ready_to_merge';
     await this.persist(run);
   }
-  private async reconcileMessages(run: Run, agent: RpcAgent, role: Role): Promise<void> {
+  private async reconcileMessages(run: Run, agent: WorkerAgent, role: Role): Promise<void> {
     if (!run.pendingMessages?.some(message => message.role === role)) return;
     const transcript = JSON.stringify(await agent.getMessages());
     const pending = run.pendingMessages.filter(message => message.role !== role || !transcript.includes(message.marker));
@@ -652,7 +668,7 @@ export class Orchestrator {
   async close(): Promise<void> {
     this.closing = true;
     clearTimeout(this.timer);
-    // Closing RPC stdin releases any input hook whose prompt acceptance is holding the queue.
+    // Closing first releases any worker input hook whose prompt acceptance is holding the queue.
     await Promise.allSettled([...this.active.values()].map(live => live.agent.close()));
     await this.serial(async () => {
       const results = await Promise.allSettled([...this.active.keys()].map(issue => this.stopAgent(this.require(issue))));

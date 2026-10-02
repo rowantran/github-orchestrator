@@ -14,7 +14,6 @@
     "bin/",
     "dist/orchestrator/",
     "agent-context/",
-    "extensions/orchestration.mjs",
     "dashboard/app.js",
     "dashboard/index.html",
     "dashboard/style.css",
@@ -33,6 +32,10 @@
     "prepare": "npm run build"
   },
   "dependencies": {
+    "@earendil-works/chord": "^1.0.0",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
     "commander": "^14.0.0",
     "smol-toml": "^1.4.2",
     "yaml": "^2.9.1"

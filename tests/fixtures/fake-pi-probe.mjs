@@ -1,5 +1,5 @@
 // Extension commands and handled input hooks only; this fixture never invokes a model.
-import orchestration from "../../extensions/orchestration.mjs";
+import orchestration from "../../dist/orchestrator/agents/rpc/report-extension.js";
 
 export default function probe(pi) {
   pi.on("input", async (event, ctx) => {

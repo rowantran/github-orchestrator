@@ -2,6 +2,7 @@ import { Command, InvalidArgumentError } from 'commander';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Core, initConfig, loadConfig, parseIssue, issueUrl, systemRunner, type Config } from './core/index.js';
+import { diagnoseAgents } from './agents/index.js';
 import { descriptor, ensureService, findService, runtimeDirectory, serve, serviceRequest, type ServiceDescriptor, type ServiceOptions } from './service.js';
 import { stopService, waitForAgents } from './wait.js';
 import type { Mode, Role, Run } from './types.js';
@@ -33,8 +34,10 @@ export async function main(argv = process.argv): Promise<void> {
     const result = await api.doctor();
     const version = await checkVersion(systemRunner);
     result[version.ok ? 'checks' : 'warnings'].push(version.message);
-    try { await systemRunner.run({ argv: ['pi', '--version'], cwd: api.config.checkout }); result.checks.push('Pi available'); }
-    catch { result.warnings.push('Pi is not available on PATH; install Pi before starting agents.'); }
+    const { agents } = api.config;
+    const runtime = await diagnoseAgents(agents.runtime, api.config.checkout,
+      { planner: agents.planner_model, implementer: agents.implementer_model, reviewer: agents.reviewer_model });
+    result.checks.push(...runtime.checks); result.warnings.push(...runtime.warnings);
     try { await systemRunner.run({ argv: ['flock', '--version'], cwd: api.config.checkout }); result.checks.push('flock available for OS-held worker locks'); }
     catch { result.warnings.push('flock is required for service ownership (Linux: util-linux; macOS: brew install flock).'); }
     json(result);

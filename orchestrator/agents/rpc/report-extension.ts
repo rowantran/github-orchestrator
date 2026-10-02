@@ -1,50 +1,27 @@
 import { Type } from "@earendil-works/pi-ai";
-import { randomUUID } from "node:crypto";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { fstatSync, statSync } from "node:fs";
-import { link, mkdir, open, readFile, unlink } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
-import { acquireLock } from "../dist/orchestrator/store.js";
+import { isAbsolute, join } from "node:path";
+import { acquireLock, type OwnedLock } from "../../store.js";
+import type { Role } from "../../types.js";
+import { buildReport, reportDescription, reportKinds as kinds, writeReport } from "../report.js";
 
-const kinds = ["skeleton_ready", "implementation_ready", "review_passed", "changes_requested", "needs_input"];
-const descriptionPath = new URL("../agent-context/runtime/report-tool.md", import.meta.url);
+export { writeReport };
 
-/** Publish one complete immutable result; readers never observe a partial JSON document. */
-export async function writeReport(reportPath, report) {
-  const directory = dirname(reportPath);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  const temporary = `${reportPath}.${process.pid}.${randomUUID()}.tmp`;
-  const contents = `${JSON.stringify(report)}\n`;
-  try {
-    const file = await open(temporary, "wx", 0o600);
-    try {
-      await file.writeFile(contents, "utf8");
-      await file.sync();
-    } finally { await file.close(); }
-    try {
-      // link() is atomic and does not replace a result from another invocation.
-      await link(temporary, reportPath);
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      if (await readFile(reportPath, "utf8") !== contents) throw new Error("Conflicting phase report already exists");
-    }
-    const folder = await open(directory, "r");
-    try { await folder.sync(); } finally { await folder.close(); }
-  } finally {
-    await unlink(temporary).catch((error) => { if (error.code !== "ENOENT") throw error; });
-  }
-}
-
-export default async function orchestration(pi) {
+/**
+ * Pi extension loaded explicitly into RPC workers (`pi --extension`). It adds `gho_report` and guards the
+ * worktree writer lock. The service passes the phase identity through GHO_* environment variables.
+ */
+export default async function orchestration(pi: ExtensionAPI): Promise<void> {
   const reportPath = process.env.GHO_REPORT_PATH;
   const phaseToken = process.env.GHO_PHASE_TOKEN;
-  const role = process.env.GHO_AGENT_ROLE;
+  const role = process.env.GHO_AGENT_ROLE as Role;
   // Loading the package in an ordinary Pi session must not add orchestration tools.
   if (!reportPath && !phaseToken) return;
-  if (!reportPath || !isAbsolute(reportPath) || !phaseToken || phaseToken.length > 256) {
+  if (!reportPath || !isAbsolute(reportPath) || !phaseToken || phaseToken.length > 256 || (role !== "implementer" && role !== "reviewer")) {
     throw new Error("Invalid orchestration report configuration");
   }
-  const description = (await readFile(descriptionPath, "utf8")).replace(/^<!--[^]*?-->\s*/, "").trim();
-  if (!description) throw new Error("Empty orchestration report description");
+  const description = await reportDescription();
   pi.registerTool({
     name: "gho_report",
     label: "gho_report",
@@ -58,21 +35,12 @@ export default async function orchestration(pi) {
     }, { additionalProperties: false }),
     async execute(_id, params, signal) {
       if (signal?.aborted) throw new Error("Phase report cancelled");
-      if (!kinds.includes(params.kind) || typeof params.summary !== "string" || !params.summary.trim()
-        || params.summary.length > 16384 || (params.findings !== undefined && (!Array.isArray(params.findings)
-          || params.findings.length > 100 || params.findings.some((finding) => typeof finding !== "string"
-            || !finding.trim() || finding.length > 4096)))) throw new Error("Invalid phase report");
-      if ((role === "reviewer" && ["skeleton_ready", "implementation_ready"].includes(params.kind))
-        || (role === "implementer" && ["review_passed", "changes_requested"].includes(params.kind))) {
-        throw new Error("Report kind does not match agent role");
-      }
-      const report = { phaseToken, kind: params.kind, summary: params.summary };
-      if (params.findings !== undefined) report.findings = [...params.findings];
+      const report = buildReport(params, role, phaseToken);
       await writeReport(reportPath, report);
       return { content: [{ type: "text", text: JSON.stringify(report) }], details: report, terminate: true };
     },
   });
-  let releaseWriter;
+  let releaseWriter: OwnedLock | undefined;
   let inheritedWriter = false;
   pi.on("session_start", async (_event, ctx) => {
     // The driver locks before Pi opens a session, then passes the shared description as fd 3.

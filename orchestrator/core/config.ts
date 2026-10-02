@@ -47,8 +47,11 @@ export async function loadConfig(cwd: string, configDir?: string, runner: Runner
   const global = await readConfig(join(dir, 'config.toml')), local = await readConfig(join(dir, 'repos', `${location.repo}.toml`));
   keys(global, ['owner', 'agents', 'obsidian', 'orchestration']); keys(local, ['project_url', 'base_branch', 'orchestration']);
   const owner = string(global.owner, 'owner'); ensure(ownerPattern.test(owner), 'owner must be a GitHub login.');
-  const agents = table(global.agents ?? {}, 'agents'); keys(agents, ['planner_model', 'implementer_model', 'reviewer_model']);
-  for (const [key, model] of Object.entries(agents)) ensure(modelPattern.test(string(model, `agents.${key}`)), `agents.${key} must be a Pi model pattern.`);
+  const agents = table(global.agents ?? {}, 'agents'); keys(agents, ['runtime', 'planner_model', 'implementer_model', 'reviewer_model']);
+  for (const [key, value] of Object.entries(agents)) {
+    if (key === 'runtime') ensure(value === 'durable' || value === 'rpc', 'agents.runtime must be "durable" or "rpc".');
+    else ensure(modelPattern.test(string(value, `agents.${key}`)), `agents.${key} must be a Pi model pattern.`);
+  }
   const project_url = string(local.project_url, 'project_url');
   ensure(/^https:\/\/github\.com\/(?:users|orgs)\/[A-Za-z0-9-]+\/projects\/[1-9][0-9]*\/?$/.test(project_url), 'Fill in project_url with a github.com user or organization Project URL.');
   const base_branch = string(local.base_branch ?? 'main', 'base_branch'); ensure(validBranch(base_branch), 'Invalid base_branch.');
@@ -68,7 +71,7 @@ export async function initConfig(cwd: string, configDir?: string, runner: Runner
   else {
     const owner = (await runner.run({ argv: ['gh', 'api', '--hostname', 'github.com', 'user', '--jq', '.login'], env: { GH_HOST: 'github.com' }, cwd })).trim();
     ensure(ownerPattern.test(owner), 'owner must be a GitHub login.');
-    files.push({ path: global, content: `owner = ${JSON.stringify(owner)}\n\n[agents]\n# planner_model = "provider/model"\n# implementer_model = "provider/model"\n# reviewer_model = "provider/model"\n\n[obsidian]\n# vault = "/path/to/vault"\n` });
+    files.push({ path: global, content: `owner = ${JSON.stringify(owner)}\n\n[agents]\n# runtime = "durable"  # or "rpc" for full Pi CLI workers\n# planner_model = "provider/model"\n# implementer_model = "provider/model"\n# reviewer_model = "provider/model"\n\n[obsidian]\n# vault = "/path/to/vault"\n` });
   }
   const location = await locate(cwd, runner);
   if (location) {

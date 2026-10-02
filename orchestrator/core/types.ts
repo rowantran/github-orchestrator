@@ -1,4 +1,6 @@
-export interface Agents { planner_model?: string; implementer_model?: string; reviewer_model?: string }
+import type { AgentRuntime } from '../agents/types.js';
+export type { AgentRuntime };
+export interface Agents { runtime?: AgentRuntime; planner_model?: string; implementer_model?: string; reviewer_model?: string }
 export interface OrchestrationConfig { max_concurrency?: number; poll_interval_ms?: number; agent_timeout_ms?: number; max_attempts?: number; max_review_rounds?: number }
 export interface Config {
   repo: string; owner: string; project_url: string; checkout: string; base_branch: string;

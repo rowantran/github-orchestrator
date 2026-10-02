@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import test, { type TestContext } from "node:test";
-import { PiAgent, type PiAgentOptions, type RpcEvent } from "../orchestrator/rpc.js";
-import type { RpcAgent } from "../orchestrator/types.js";
+import { PiAgent, type PiAgentOptions, type RpcEvent } from "../orchestrator/agents/rpc/index.js";
+import type { WorkerAgent } from "../orchestrator/agents/types.js";
 
 const root = new URL(existsSync(new URL("../package.json", import.meta.url)) ? "../" : "../../", import.meta.url);
 const fixture = fileURLToPath(new URL("tests/fixtures/fake-pi.mjs", root));
@@ -31,7 +31,7 @@ async function waitFor(check: () => boolean) {
 }
 
 // This assignment checks the service's public structural contract at compile time.
-const compatible = (agent: PiAgent): RpcAgent => agent;
+const compatible = (agent: PiAgent): WorkerAgent => agent;
 
 test("normal CLI flags, explicit stable identity, resources, report environment and idempotent start", async (t) => {
   const { agent, cwd, options } = await setup(t);

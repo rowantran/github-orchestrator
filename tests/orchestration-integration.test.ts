@@ -6,7 +6,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Orchestrator } from '../orchestrator/engine.js';
-import { PiAgent } from '../orchestrator/rpc.js';
+import { createModels } from '@earendil-works/pi-ai/models';
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall, type FauxResponseFactory } from '@earendil-works/pi-ai/providers/faux';
+import { DurableAgent, type DurableRuntime } from '../orchestrator/agents/durable/index.js';
+import { PiAgent } from '../orchestrator/agents/rpc/index.js';
 import { RunStore, atomicJson } from '../orchestrator/store.js';
 import { startServer, type DashboardServer, type ServiceAPI } from '../orchestrator/http.js';
 import { SystemRunner, type Runner } from '../orchestrator/core/process.js';
@@ -15,6 +18,43 @@ import type { Config } from '../orchestrator/core/types.js';
 import type { ExecutionCore, PullRequestInfo, Run, TaskInfo } from '../orchestrator/types.js';
 
 const executable = fileURLToPath(new URL('../../tests/fixtures/workflow-pi.mjs', import.meta.url));
+const durableStep = fileURLToPath(new URL('../../tests/fixtures/durable-workflow-step.mjs', import.meta.url));
+
+/**
+ * A faux model that works like a disciplined worker: it runs the fixture step through the real durable bash tool,
+ * retries the step after an interrupted call, then reports. No model provider or GitHub command is contacted.
+ */
+function durableRuntime(): DurableRuntime & { requests: () => number } {
+  const faux = fauxProvider({ provider: 'fixture', models: [{ id: 'planner' }, { id: 'coder' }, { id: 'reviewer' }] });
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const respond: FauxResponseFactory = context => {
+    const messages = context.messages;
+    const text = (message: (typeof messages)[number]) => JSON.stringify(message.content);
+    const promptIndex = messages.findLastIndex(message => message.role === 'user' && text(message).includes('Task and execution data:'));
+    const prompt = messages[promptIndex]!.content;
+    const promptText = typeof prompt === 'string' ? prompt : prompt.flatMap(block => block.type === 'text' ? [block.text] : []).join('');
+    const phase = JSON.parse(promptText.slice(promptText.indexOf('{'))) as { phase: string; phaseToken: string };
+    const after = messages.slice(promptIndex + 1);
+    const stepDone = after.some(message => message.role === 'toolResult' && message.toolName === 'bash' && !message.isError);
+    if (!stepDone) {
+      const argument = Buffer.from(JSON.stringify(phase)).toString('base64url');
+      return fauxAssistantMessage([fauxToolCall('bash', { command: `${JSON.stringify(process.execPath)} ${JSON.stringify(durableStep)} ${argument}` })], { stopReason: 'toolUse' });
+    }
+    const kind = phase.phase === 'planning' ? 'skeleton_ready' : phase.phase === 'implementing' ? 'implementation_ready' : 'review_passed';
+    return fauxAssistantMessage([fauxText(`Reporting ${kind}.`), fauxToolCall('gho_report', { kind, summary: `${phase.phase}: fixture step verified` })], { stopReason: 'toolUse' });
+  };
+  faux.setResponses(Array.from({ length: 200 }, () => respond));
+  return {
+    models, settings: { retry: { enabled: false } },
+    async resolveModel(pattern) {
+      const id = (pattern ?? 'fixture/planner').split('/')[1]!;
+      return { model: { provider: 'fixture', modelId: id }, thinkingLevel: 'off' };
+    },
+    async resources() { return { sections: { preamble: 'Fixture durable worker.' } }; },
+    requests: () => faux.state.callCount,
+  };
+}
 const system = new SystemRunner();
 interface FixtureState {
   fixture: 'gho-workflow-test'; issue: number; checks: PullRequestInfo['checks'];
@@ -78,7 +118,7 @@ async function jsonLines<T>(path: string): Promise<T[]> {
   try { return (await readFile(path, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as T); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
 }
-async function fixture(t: { after(fn: () => Promise<void>): void }, settings: { holdPhases?: string[]; requestChangesOnce?: boolean; checks?: PullRequestInfo['checks'] } = {}) {
+async function fixture(t: { after(fn: () => Promise<void>): void }, settings: { holdPhases?: string[]; requestChangesOnce?: boolean; checks?: PullRequestInfo['checks']; durable?: DurableRuntime } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'gho-workflow-integration-')), checkout = join(root, 'repo'); await mkdir(checkout);
   await git(checkout, ['init', '-b', 'main']); await writeFile(join(checkout, 'README.md'), '# Temporary integration repository\n'); await git(checkout, ['add', 'README.md']);
   await git(checkout, ['-c', 'user.name=Workflow Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'Initial fixture']);
@@ -86,7 +126,9 @@ async function fixture(t: { after(fn: () => Promise<void>): void }, settings: { 
   const errors: string[] = [];
   let core = new FileExecutionCore(checkout, issue, settings), store = new RunStore(storeRoot), engine: Orchestrator, server: DashboardServer;
   const start = async () => {
-    engine = new Orchestrator(core, store, options => new PiAgent({ ...options, command: process.execPath, args: [executable], startupTimeoutMs: 5_000, commandTimeoutMs: 5_000, shutdownTimeoutMs: 500 }),
+    const runtime = settings.durable;
+    engine = new Orchestrator(core, store, options => runtime ? new DurableAgent({ ...options, runtime })
+      : new PiAgent({ ...options, command: process.execPath, args: [executable], startupTimeoutMs: 5_000, commandTimeoutMs: 5_000, shutdownTimeoutMs: 500 }),
       { concurrency: 1, pollMs: 100, runTimeoutMs: 15_000, maxReviewRounds: 3, onError: error => errors.push(String(error)) });
     await engine.initialize();
     const api: ServiceAPI = {
@@ -96,7 +138,13 @@ async function fixture(t: { after(fn: () => Promise<void>): void }, settings: { 
     };
     server = await startServer(api, { requestTimeoutMs: 10_000 }); engine.begin();
   };
-  t.after(async () => { try { await server?.close(); await engine?.close(); } finally { await rm(root, { recursive: true, force: true }); } });
+  t.after(async () => {
+    try { await server?.close(); await engine?.close(); }
+    finally {
+      await writeFile(join(core.worktree(), '.gho', 'step-release'), '').catch(() => {});
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   await start();
   async function request<T>(path: string, body?: unknown, expected = 200): Promise<T> {
     const response = await fetch(new URL(path, server.url), { method: body === undefined ? 'GET' : 'POST', headers: { 'x-gho-token': server.token, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(12_000) });
@@ -193,4 +241,48 @@ test('HTTP unsupervised workflow still records a real skeleton approval and inde
   await f.core.update(value => { value.taskState = 'CLOSED'; value.completed = true; });
   await f.waitRun('external issue completion', current => current.phase === 'done');
   assert.equal((await f.core.state()).mutations.length, 1); assert.deepEqual(f.errors, []);
+});
+
+test('HTTP → engine → Pi Durable: unsupervised workflow through real durable tools, then human-merge gate', { timeout: 30_000 }, async t => {
+  const runtime = durableRuntime();
+  const f = await fixture(t, { durable: runtime });
+  const path = `/api/runs/${f.issue}`;
+  await f.request(`${path}/start`, { mode: 'unsupervised' });
+  const run = await f.waitRun('automatic workflow ready for human merge', current => current.phase === 'ready_to_merge');
+  const state = await f.core.state();
+  assert.equal(state.planningCommits, 1); assert.equal(state.implementationCommits, 1);
+  assert.equal(run.approval?.source, 'automatic'); assert.equal(run.approvedSha, run.skeletonSha); assert.notEqual(run.skeletonSha, run.reviewedSha);
+  assert.deepEqual(state.contexts.map(context => [context.phase, context.model]), [['planning', 'fixture/planner'], ['implementing', 'fixture/coder'], ['reviewing', 'fixture/reviewer']]);
+  assert.equal(state.contexts[0]!.sessionId, state.contexts[1]!.sessionId, 'planner and implementer share one durable conversation');
+  assert.notEqual(state.contexts[2]!.sessionId, state.contexts[0]!.sessionId);
+  assert.equal(state.pr!.draft, false); assert.equal(state.mutations.filter(mutation => mutation.kind === 'publish').length, 1);
+  assert.equal(await git(f.checkout, ['rev-parse', 'main']), f.initialSha);
+  assert.equal(runtime.requests(), 6, 'one step and one report request per phase; gho_report terminates each run');
+  const transcript = await f.request<{ messages: Array<{ role: string }>; events: Array<{ type: string }> }>(`${path}/agents/implementer`);
+  assert.match(JSON.stringify(transcript.messages), /implementation_ready/);
+  assert.ok(transcript.events.some(event => event.type === 'tool_execution_end'));
+  assert.ok(transcript.events.some(event => event.type === 'driver_ready'));
+  assert.deepEqual(f.errors, []);
+});
+
+test('Pi Durable: a service restart mid-tool resumes the same turn without a new prompt or a repeated commit', { timeout: 30_000 }, async t => {
+  const runtime = durableRuntime();
+  const f = await fixture(t, { durable: runtime, holdPhases: ['planning'] });
+  const path = `/api/runs/${f.issue}`;
+  await f.request(`${path}/start`, { mode: 'unsupervised' });
+  const holding = join(f.core.worktree(), '.gho', 'step-holding');
+  await until('planning step holds inside the bash tool', async () => (await readFile(holding, 'utf8').catch(() => '')) !== '');
+  assert.equal((await f.core.state()).planningCommits, 1);
+  const token = (await f.run()).dispatch!.id;
+  await f.restart();
+  const run = await f.waitRun('workflow ready after resumed planning turn', current => current.phase === 'ready_to_merge');
+  const state = await f.core.state();
+  assert.equal(state.planningCommits, 1, 'recovery must not repeat the committed side effect');
+  assert.equal(state.contexts.filter(context => context.phase === 'planning').length, 2, 'the interrupted step was retried by the model');
+  assert.equal(run.approvedSha, run.skeletonSha);
+  const transcript = await f.request<{ messages: Array<{ role: string; content: unknown; isError?: boolean }> }>(`${path}/agents/implementer`);
+  const users = transcript.messages.filter(message => message.role === 'user').map(message => JSON.stringify(message.content));
+  assert.equal(users.filter(text => text.includes(token)).length, 1, 'the resumed turn needs no recovery prompt');
+  assert.ok(transcript.messages.some(message => message.role === 'toolResult' && message.isError && JSON.stringify(message.content).includes('interrupted')));
+  assert.deepEqual(f.errors, []);
 });

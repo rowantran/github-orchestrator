@@ -8,7 +8,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
-import { PiAgent, type PiAgentOptions, type RpcEvent } from "../orchestrator/rpc.js";
+import { PiAgent, type PiAgentOptions, type RpcEvent } from "../orchestrator/agents/rpc/index.js";
 import { acquireLock } from "../orchestrator/store.js";
 
 const root = new URL(existsSync(new URL("../package.json", import.meta.url)) ? "../" : "../../", import.meta.url);

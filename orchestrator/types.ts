@@ -1,3 +1,4 @@
+import type { AgentRuntime } from './agents/types.js';
 export type Mode = 'supervised' | 'unsupervised';
 export type Role = 'implementer' | 'reviewer';
 export type Phase = 'queued' | 'planning' | 'awaiting_approval' | 'implementing' | 'reviewing' | 'ready_to_merge' | 'paused' | 'blocked' | 'done' | 'closed';
@@ -82,7 +83,7 @@ export interface TaskInfo {
 }
 export interface ReadyEntry { number: number; state: string; worktree?: string | null; branch?: string; }
 export interface ExecutionCore {
-  config: { repo: string; owner: string; checkout: string; agents: { planner_model?: string; implementer_model?: string; reviewer_model?: string } };
+  config: { repo: string; owner: string; checkout: string; agents: { runtime?: AgentRuntime; planner_model?: string; implementer_model?: string; reviewer_model?: string } };
   ready(all?: boolean): Promise<ReadyEntry[]>;
   snapshot(): Promise<{ tasks: Array<{ number: number }> }>;
   createWorktree(issue: number): Promise<{ path: string; branch: string; base_branch: string; brief: string }>;
@@ -92,28 +93,3 @@ export interface ExecutionCore {
   publishPullRequest(number: number): Promise<void>;
   draftPullRequest?(number: number): Promise<void>;
 }
-export interface RpcAgent {
-  readonly pid?: number;
-  start(): Promise<void>;
-  prompt(text: string): Promise<unknown>;
-  steer(text: string): Promise<unknown>;
-  abort(): Promise<unknown>;
-  close(): Promise<void>;
-  getMessages(): Promise<unknown>;
-  getState(): Promise<unknown>;
-  respond(response: Record<string, unknown>): Promise<unknown> | void;
-  onEvent(listener: (event: Record<string, unknown>) => void): (() => void) | void;
-}
-export interface AgentOptions {
-  cwd: string;
-  sessionId: string;
-  sessionDir: string;
-  role: Role;
-  model?: string;
-  command?: string;
-  args?: string[];
-  instructionsPath: string;
-  reportPath: string;
-  phaseToken: string;
-}
-export type AgentFactory = (options: AgentOptions) => RpcAgent;

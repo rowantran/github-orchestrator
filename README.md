@@ -14,7 +14,7 @@ Closing the supervisor's session does not stop enrolled tasks. The service never
 
 ## Install and configure
 
-Requirements: Linux or macOS, Node.js 24+, Git, an authenticated GitHub CLI (`gh` 2.94+ for native issue dependencies), Worktrunk (`wt`), and the normal Pi CLI on `PATH`. The service also needs `flock` for OS-held locks (included in Linux util-linux; on macOS: `brew install flock`).
+Requirements: Linux or macOS, Node.js 24+, Git, an authenticated GitHub CLI (`gh` 2.94+ for native issue dependencies), Worktrunk (`wt`), and a configured Pi installation (`~/.pi/agent`). The Pi CLI on `PATH` is needed only for `agents.runtime = "rpc"`. The service also needs `flock` for OS-held locks (included in Linux util-linux; on macOS: `brew install flock`).
 
 ```sh
 npm ci
@@ -35,6 +35,9 @@ gho doctor
 owner = "your-github-login"
 
 [agents]
+# "durable" (default): workers run on Pi Durable inside the service.
+# "rpc": each worker is a full `pi --mode rpc` process with all of your Pi extensions.
+runtime = "durable"
 # Optional normal Pi model patterns. Omit to use Pi's settings/saved session model.
 planner_model = "provider/planning-model"
 implementer_model = "provider/implementation-model"
@@ -120,7 +123,19 @@ GitHub approval commands must come from the configured `owner`. A changed revisi
 
 A nudge is **not approval**. Nudging a planner at the approval gate starts skeleton revision, not implementation. Messages to paused/blocked work are retained but do not resume it. A supervisor may run `approve` when you explicitly ask it to approve that revision. The workflow never interprets “looks good” as permission.
 
-Pi's normal global/project settings, credentials, providers, extensions, skills, and applicable `AGENTS.md` files load from the worker's worktree. The service adds its own instructions and a structured `gho_report` tool. It does not replace your normal harness. RPC supports standard extension dialogs; terminal-specific custom UI is not supported. The dashboard offers explicit answers, not automatic confirmation. Tested with Pi 0.99.2. In that version, an extension that awaits a dialog inside `session_start` can block before Pi installs its RPC input reader; defer that dialog to an input/tool hook or give it a finite timeout. The service reports startup failure rather than automatically approving it.
+### Worker runtimes
+
+**Durable (default).** Each task role is a [Pi Durable](https://earendil.com/posts/pi-durable/) conversation hosted by the service. Workers inherit from your normal Pi configuration:
+
+- credentials (`auth.json`), `models.json`, and providers that installed Pi extensions register (for example a company LLM proxy);
+- the default provider, model, and thinking level, plus compaction, retry, steering, follow-up, shell, and HTTP proxy/timeout settings;
+- global and project `AGENTS.md`/context files, skills (including skills from Pi packages), `SYSTEM.md`, and `APPEND_SYSTEM.md`, rendered by Pi's own system prompt builder.
+
+Workers get `read`, `bash`, `edit`, `write`, and `gho_report`. Pi extension tools, hooks, commands, MCP servers, and dialogs do **not** run in durable workers; Pi extensions load only so their providers register. Extensions that choose a model at session start (for example a machine-local model override) have no effect; set `agents.*_model` instead. `gho doctor` loads your Pi configuration like the service and shows which model each role resolves to, without contacting a model. Durable workers depend on the exact pinned Pi version because Pi does not export its system prompt builder.
+
+**RPC.** Set `runtime = "rpc"` to launch the actual `pi --mode rpc` executable per role. It loads every Pi extension, tool, and MCP server and supports standard extension dialogs, answered explicitly in the dashboard; terminal-specific custom UI is not supported. Tested with Pi 0.99.2. In that version, an extension that awaits a dialog inside `session_start` can block before Pi installs its RPC input reader; defer that dialog to an input/tool hook or give it a finite timeout. The service reports startup failure rather than automatically approving it.
+
+The service adds its own instructions and a structured `gho_report` tool in both runtimes. Changing the runtime of a task that already has a conversation starts a new conversation for that role; the recovery prompt tells it to inspect existing work first.
 
 ## Service lifecycle and recovery
 
@@ -131,11 +146,11 @@ gho service stop                # saves state and stops owned agents
 gho serve                       # foreground alternative
 ```
 
-`run` and `dashboard` start the service if needed. One service owns a repository's Git common directory, including its worktrees. Each Pi worker also holds an OS lock for its worktree, so a replacement cannot overlap a delayed old worker. Configure it under a process manager if it must restart automatically after machine/process failure.
+`run` and `dashboard` start the service if needed. One service owns a repository's Git common directory, including its worktrees. Each worker also holds an OS lock for its worktree, so a replacement cannot overlap a delayed old worker. Configure it under a process manager if it must restart automatically after machine/process failure.
 
-GitHub remains the task store. Private execution checkpoints, event journals, the service descriptor, and logs live in `<git-common-dir>/gho-service/`. Pi sessions and phase reports live in each worktree's ignored `.gho/`. There is no local task database. Preserve these files to preserve approvals and conversation identity; they may contain sensitive task and agent output.
+GitHub remains the task store. Private execution checkpoints, event journals, the service descriptor, and logs live in `<git-common-dir>/gho-service/`. Worker conversations (`.gho/sessions/<session>.sqlite` for durable workers, Pi JSONL sessions for RPC workers) and phase reports live in each worktree's ignored `.gho/`. There is no local task database. Preserve these files to preserve approvals and conversation identity; they may contain sensitive task and agent output.
 
-A restart reuses the same task/role session IDs, preserves approval gates, and checks persisted phase reports before resuming an interrupted turn. This is task/session recovery, not exactly-once execution of arbitrary shell commands. Recovery instructions require inspecting existing Git/GitHub effects before repeating actions. Do not concurrently open a service-owned session in another Pi process; inspect and message it through the dashboard/CLI instead.
+A restart reuses the same task/role session IDs, preserves approval gates, and checks persisted phase reports before resuming an interrupted turn. A durable worker continues its interrupted turn by itself: a cut-off model request is sent again, an interrupted `bash`/`edit`/`write` call is reported to the model as interrupted rather than rerun, and queued nudges are delivered into that turn. Pausing or stopping the service keeps such a turn for later; a run that exceeds its deadline is aborted first. An RPC worker instead receives a recovery prompt. This is task/session recovery, not exactly-once execution of arbitrary shell commands. Recovery instructions require inspecting existing Git/GitHub effects before repeating actions. Do not concurrently open a service-owned session in another Pi process; inspect and message it through the dashboard/CLI instead.
 
 ## Task dependencies and workstreams
 
@@ -185,12 +200,12 @@ Only issues closed as completed count toward note completion. See [obsidian-plug
 
 ```sh
 npm ci
-npm test                         # core, engine, RPC, HTTP, CLI, and Pi integration tests
+npm test                         # core, engine, RPC, Pi Durable, HTTP, CLI, and Pi integration tests
 npm run test:browser              # Playwright CLI: real HTTP server and browser flows
 (cd dashboard && npm test && npm run build)
 (cd obsidian-plugin && npm ci && npm test && npm run build)
 ```
 
-Browser setup: `npx playwright install --with-deps chromium`. Tests use temporary repositories/vaults, fake GitHub/Pi subprocesses, and isolated service state. The installed-Pi smoke test exercises real RPC resource discovery without a model request or real credentials. No test creates real issues/PRs or changes a real vault.
+Browser setup: `npx playwright install --with-deps chromium`. Tests use temporary repositories/vaults, fake GitHub/Pi subprocesses, and isolated service state. The installed-Pi smoke test exercises real RPC resource discovery without a model request or real credentials. Durable worker tests use Pi's faux provider and a local OpenAI-compatible fake server. No test creates real issues/PRs or changes a real vault.
 
 [docs/architecture.md](docs/architecture.md) describes implementation ownership. [tests/orchestration-browser/README.md](tests/orchestration-browser/README.md) describes the Playwright CLI suite for the TypeScript service and dashboard.

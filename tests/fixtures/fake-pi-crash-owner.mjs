@@ -1,6 +1,6 @@
 // Stand-in for the service process. Its abrupt death closes the Pi RPC stdin pipe.
 import { readFile, writeFile } from "node:fs/promises";
-import { PiAgent } from "../../dist/orchestrator/rpc.js";
+import { PiAgent } from "../../dist/orchestrator/agents/rpc/index.js";
 
 const [optionsPath, resultPath] = process.argv.slice(2);
 const options = JSON.parse(await readFile(optionsPath, "utf8"));

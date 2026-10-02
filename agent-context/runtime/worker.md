@@ -1,4 +1,4 @@
-<!-- Purpose: task worker behavior. Audience: Pi planner/implementer. Injection: appended system prompt for service-owned RPC sessions. -->
+<!-- Purpose: task worker behavior. Audience: Pi planner/implementer. Injection: conversation instructions for service-owned durable sessions, or appended system prompt for RPC sessions. -->
 # Work on one assigned task
 Use the normal project instructions, tools, skills, and verification commands. Read `.gho/brief.md` and the issue, including its comments, before planning. Recheck the issue when new phase instructions arrive.
 Work only on the assigned branch and worktree. Never merge a pull request, close an issue, grant yourself approval, or start another task.

@@ -1,6 +1,6 @@
 // Each invocation is an independent service harness; it never sends a model prompt.
 import { readFile } from "node:fs/promises";
-import { PiAgent } from "../../dist/orchestrator/rpc.js";
+import { PiAgent } from "../../dist/orchestrator/agents/rpc/index.js";
 
 const options = JSON.parse(await readFile(process.argv[2], "utf8"));
 const agent = new PiAgent(options);

@@ -5,17 +5,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Orchestrator } from '../orchestrator/engine.js';
 import { RunStore, acquireLock } from '../orchestrator/store.js';
-import type { AgentOptions, ExecutionCore, PullRequestInfo, Report, RpcAgent } from '../orchestrator/types.js';
+import type { AgentOptions, WorkerAgent } from '../orchestrator/agents/types.js';
+import type { ExecutionCore, PullRequestInfo, Report } from '../orchestrator/types.js';
 
 const skeleton = 'a'.repeat(40), implementation = 'b'.repeat(40), revision = 'c'.repeat(40);
-class FakeAgent implements RpcAgent {
+class FakeAgent implements WorkerAgent {
   listeners = new Set<(e: Record<string, unknown>) => void>();
-  prompts: string[] = []; nudges: string[] = []; closed = false;
+  prompts: string[] = []; nudges: string[] = []; closed = false; aborted = false; resumedWork = false;
   constructor(readonly options: AgentOptions, readonly history: unknown[] = []) {}
   async start() {}
   async prompt(text: string) { this.prompts.push(text); this.history.push({ role: 'user', content: text }); }
   async steer(text: string) { this.nudges.push(text); }
-  async abort() {}
+  async abort() { this.aborted = true; }
   async close() { this.closed = true; }
   async getMessages() { return { messages: [...this.history, { role: 'assistant', content: [{ type: 'text', text: 'Working' }] }] }; }
   async getState() { return {}; }
@@ -29,11 +30,11 @@ class FakeAgent implements RpcAgent {
     this.emit({ type: 'agent_settled' });
   }
 }
-async function fixture(t: { after(fn: () => unknown): void }, options: { concurrency?: number; maxReviewRounds?: number } = {}) {
+async function fixture(t: { after(fn: () => unknown): void }, options: { concurrency?: number; maxReviewRounds?: number; runTimeoutMs?: number } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'gho-engine-'));
   const agents: FakeAgent[] = [];
   let ready = true, closed = false, provisioned = 0, publishes = 0;
-  let nextStartFails = false, nextPromptHook = false, loseNextAcceptance = false;
+  let nextStartFails = false, nextPromptHook = false, loseNextAcceptance = false, nextResumes = false;
   const pr: PullRequestInfo = { number: 100, url: 'https://github.com/owner/repo/pull/100', headSha: skeleton, head: 'owner/gh-1', base: 'main', draft: true, state: 'OPEN', checks: 'passed', feedback: [] };
   const core: ExecutionCore = {
     config: { repo: 'owner/repo', owner: 'owner', checkout: root, agents: { planner_model: 'provider/planner', implementer_model: 'provider/coder', reviewer_model: 'provider/reviewer' } },
@@ -51,6 +52,7 @@ async function fixture(t: { after(fn: () => unknown): void }, options: { concurr
     let history = histories.get(options.sessionId);
     if (!history) { history = []; histories.set(options.sessionId, history); }
     const agent = new FakeAgent(options, history);
+    if (nextResumes) { nextResumes = false; agent.resumedWork = true; }
     if (nextStartFails) { nextStartFails = false; agent.start = async () => { throw new Error('startup failed before prompting'); }; }
     if (loseNextAcceptance) {
       loseNextAcceptance = false;
@@ -77,7 +79,7 @@ async function fixture(t: { after(fn: () => unknown): void }, options: { concurr
   return {
     get engine() { return engine; }, core, store, agents, pr,
     setReady(value: boolean) { ready = value; }, setClosed() { closed = true; },
-    failNextStart() { nextStartFails = true; }, holdNextPrompt() { nextPromptHook = true; }, loseNextAcceptance() { loseNextAcceptance = true; },
+    failNextStart() { nextStartFails = true; }, resumeNext() { nextResumes = true; }, holdNextPrompt() { nextPromptHook = true; }, loseNextAcceptance() { loseNextAcceptance = true; },
     get provisioned() { return provisioned; }, get publishes() { return publishes; },
     latest() { return agents.at(-1)!; },
     async report(kind: Report['kind']) { await agents.at(-1)!.report(kind); await engine.flush(); },
@@ -434,4 +436,44 @@ test('failed re-draft leaves a paused published task retryable without changing 
   f.core.draftPullRequest = draft;
   await f.engine.resume(1);
   assert.equal(f.engine.getRun(1).phase, 'implementing');
+});
+
+test('a durable worker that resumed its interrupted turn gets queued nudges, not a second phase prompt', async t => {
+  const f = await fixture(t);
+  await f.engine.start(1); await f.engine.tick();
+  const original = f.latest();
+  await f.engine.message(1, 'implementer', 'Keep the boundary test.');
+  assert.equal(f.engine.getRun(1).pendingMessages?.length, 1);
+  await f.restart();
+  f.resumeNext();
+  await f.engine.tick();
+  const resumed = f.latest();
+  assert.notEqual(resumed, original);
+  assert.equal(resumed.options.phaseToken, original.options.phaseToken);
+  assert.deepEqual(resumed.prompts, [], 'the interrupted turn continues; no recovery prompt is queued behind it');
+  assert.equal(resumed.nudges.length, 1); assert.match(resumed.nudges[0]!, /^\[gho-message:[^\]]+\]\nKeep the boundary test\.$/);
+  await f.report('skeleton_ready');
+  assert.equal(f.engine.getRun(1).phase, 'awaiting_approval');
+  assert.equal(f.engine.getRun(1).pendingMessages?.length, 0);
+});
+
+test('a resumed turn before implementation was admitted still receives the implementation prompt', async t => {
+  const f = await fixture(t);
+  await f.engine.start(1); await f.engine.tick();
+  await f.report('skeleton_ready');
+  await f.engine.approve(1, skeleton);
+  f.resumeNext();
+  await f.engine.tick();
+  assert.equal(f.latest().prompts.length, 1);
+  assert.match(f.latest().prompts[0]!, /authorized to implement/);
+});
+
+test('an agent past its deadline is aborted before it is closed, so durable work is not resumed', async t => {
+  const f = await fixture(t, { runTimeoutMs: 30 });
+  await f.engine.start(1); await f.engine.tick();
+  const agent = f.latest();
+  for (let i = 0; i < 100 && !agent.closed; i++) await new Promise(done => setTimeout(done, 10));
+  await f.engine.flush();
+  assert.equal(agent.aborted, true); assert.equal(agent.closed, true);
+  assert.match(f.engine.getRun(1).error ?? '', /deadline/);
 });
