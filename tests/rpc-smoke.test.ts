@@ -50,6 +50,7 @@ test("installed normal Pi RPC loads settings, providers, context, skills, codemo
     defaultProvider: "fixture", defaultModel: "first", defaultThinkingLevel: "medium",
     defaultTools: ["+codemode"], cacheWarming: "off", steeringMode: "all",
     extensions: [path("tests/fixtures/fake-pi-probe.mjs")],
+    packages: [fileURLToPath(root)],
   }));
   await writeFile(join(cwd, "agent", "models.json"), JSON.stringify({ providers: {
     fixture: { baseUrl: `http://127.0.0.1:${address.port}/v1`, api: "openai-completions", apiKey: "test-only-dummy-key", models: [
@@ -92,7 +93,7 @@ test("installed normal Pi RPC loads settings, providers, context, skills, codemo
   assert.equal(state.model?.id, "first");
   assert.equal(state.thinkingLevel, "low");
   const commands = await first.request("get_commands") as { commands: Array<{ name: string }> };
-  for (const name of ["gho-probe", "gho-probe-report", "gho-probe-dialog", "gho-project-probe", "fixture-template", "skill:fixture"])
+  for (const name of ["gho-probe", "gho-probe-report", "gho-probe-dialog", "gho-project-probe", "fixture-template", "skill:fixture", "skill:github-orchestrator"])
     assert(commands.commands.some((command) => command.name === name), `Missing command ${name}`);
   assert.deepEqual(await first.prompt("/gho-project-probe"), { disposition: "handled" });
   assert(notifications(events).some((event) => event.projectExtension === true));
@@ -103,7 +104,7 @@ test("installed normal Pi RPC loads settings, providers, context, skills, codemo
   for (const sentinel of ["fixture-project-context-sentinel", "fixture-user-context-sentinel", "fixture-appended-context-sentinel", "fixture-skill-sentinel"])
     assert(systemPrompt.includes(sentinel), `Missing context ${sentinel}`);
   assert((probe.tools as string[]).includes("codemode"));
-  assert((probe.tools as string[]).includes("gho_report"));
+  assert.equal((probe.tools as string[]).filter(name => name === "gho_report").length, 1);
   assert((probe.tools as string[]).includes("read"));
   assert.equal(probe.trusted, true);
   assert.deepEqual(probe.settings, { steeringMode: "one-at-a-time" });

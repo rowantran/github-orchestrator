@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { GitHub, paginate } from '../orchestrator/core/github.js';
 import { Core } from '../orchestrator/core/index.js';
 import { issueRef } from '../orchestrator/core/domain.js';
@@ -134,6 +137,108 @@ test('issue creation verifies setup and reports partial creation without retryin
   fake.issues.get(2)!.projectItems = page([]);
   await assert.rejects(core.createTask({ title: 'Task 2', body: 'body', blockedBy: [1] }), /Created .* setup is incomplete.*Repair this issue/); assert.equal(creates, 2);
 });
+test('task creation passes deduplicated cross-repository blockers and explicitly assigns the Project owner', async () => {
+  const fake = new FakeGitHub();
+  fake.issues.get(2)!.issueDependenciesSummary.totalBlockedBy = 2;
+  fake.intercept = args => {
+    if (args[1] === 'issue' && args[2] === 'create') return `${ref(2).url}\n`;
+    if (args[1] === 'project' && args[2] === 'item-add') return { id: 'PI2' };
+    if (args[4]?.includes('/2/dependencies/')) return [[{ number: 1, html_url: ref(1).url }, { number: 9, html_url: 'https://github.com/outside/repo/issues/9' }]];
+    return undefined;
+  };
+  await new Core(config, fake).createTask({ title: 'A title', body: 'A body', blockedBy: [1, 'https://github.com/outside/repo/issues/9', 1] });
+  assert.deepEqual(fake.commands.find(c => c.argv[1] === 'issue')?.argv, ['gh', 'issue', 'create', '--repo', 'github.com/acme/repo', '--title', 'A title', '--body', 'A body', '--assignee', 'alice', '--blocked-by', ref(1).url, '--blocked-by', 'https://github.com/outside/repo/issues/9']);
+  assert.deepEqual(fake.commands.find(c => c.argv[2] === 'item-add')?.argv, ['gh', 'project', 'item-add', '1', '--owner', 'alice', '--url', ref(2).url, '--format', 'json']);
+  assert.ok(!fake.commands.some(c => c.argv.includes('POST')), 'native gh issue create owns dependency writes');
+});
+
+test('task creation reports uncertain and partial writes without retrying or creating another issue', async () => {
+  for (const failure of ['create', 'project', 'dependencies', 'assignee']) {
+    const fake = new FakeGitHub(); let creates = 0;
+    fake.intercept = args => {
+      if (args[1] === 'issue' && args[2] === 'create') { creates++; if (failure === 'create') throw new CommandError('gh', 1, 'HTTP 404'); return ref(1).url; }
+      if (args[2] === 'item-add') { if (failure === 'project') throw new CommandError('gh', 1, 'HTTP 403'); return { id: 'PI1' }; }
+      return undefined;
+    };
+    if (failure === 'assignee') fake.issues.get(1)!.assignees = page([{ id: 'U2', login: 'other' }]);
+    const promise = new Core(config, fake).createTask({ title: 'Find this title', body: 'body', blockedBy: failure === 'dependencies' ? [3] : [] });
+    await assert.rejects(promise, error => {
+      assert.ok(error instanceof Error);
+      if (failure === 'create') { assert.match(error.message, /HTTP 404/); assert.match(error.message, /Find this title.*before failing/); assert.match(error.message, /do not create it twice/); }
+      else { assert.ok(error.message.includes(`Created ${ref(1).url}`)); assert.match(error.message, /Repair this issue; do not recreate it/); }
+      return true;
+    });
+    assert.equal(creates, 1);
+    if (failure !== 'dependencies') assert.ok(!fake.commands.some(c => c.argv.includes('--blocked-by')));
+  }
+});
+
+test('invalid task inputs and unknown workstreams fail before issue creation', async () => {
+  for (const options of [{ title: '', body: 'body' }, { title: 'Task', body: '' }, { title: 'Task', body: ' \n\t' }, { title: 'Task', body: 'body', blockedBy: [0] }, { title: 'Task', body: 'body', workstreams: ['../bad'] }, { title: 'Task', body: 'body', workstreams: ['unknown'] }]) {
+    const fake = new FakeGitHub();
+    await assert.rejects(new Core(config, fake).createTask(options));
+    assert.ok(!fake.commands.some(c => c.argv[2] === 'create' || c.argv.includes('POST')));
+  }
+});
+
+test('workstream creation preserves existing labels and tolerates a verified concurrent create', async () => {
+  const fake = new FakeGitHub(), github = new GitHub(config, fake);
+  await github.createWorkstream('one');
+  assert.ok(!fake.commands.some(c => c.argv.includes('POST')));
+  let writes = 0;
+  fake.intercept = args => {
+    if (!args.includes('POST')) return undefined;
+    writes++; assert.ok(args.includes('name=gho:workstream:new/child'));
+    fake.labels.push('gho:workstream:new/child');
+    throw new CommandError('gh', 1, 'HTTP 422');
+  };
+  await github.createWorkstream('new/child'); assert.equal(writes, 1);
+  assert.ok(!(await github.workstreams()).includes('new'), 'slash names do not create parent membership');
+  fake.intercept = args => { if (args.includes('POST')) { writes++; throw new CommandError('gh', 1, 'HTTP 422'); } return undefined; };
+  await assert.rejects(github.createWorkstream('missing'), /Check repository labels before retrying/); assert.equal(writes, 2);
+});
+
+test('task creation validates a TaskNote before GitHub writes and unions an existing association', async t => {
+  const vault = await mkdtemp(join(tmpdir(), 'gho-core-task-note-')); t.after(() => rm(vault, { recursive: true, force: true }));
+  const note = 'task.md', original = '---\ntype: task\n---\nKeep this note.\n'; await writeFile(join(vault, note), original);
+  const fake = new FakeGitHub(), core = new Core({ ...config, vault }, fake); let creates = 0;
+  fake.intercept = args => {
+    if (args[1] === 'issue' && args[2] === 'create') { creates++; return ref(2).url; }
+    if (args[2] === 'item-add') return { id: 'PI2' };
+    return undefined;
+  };
+  const before = await core.notesLink(note, [3]);
+  await core.createTask({ title: 'New task', body: 'Task details', note });
+  const after = (await core.notesList())[0]!;
+  assert.equal(after.id, before.id); assert.deepEqual(after.issueUrls, [ref(2).url, ref(3).url]);
+  assert.equal(await readFile(join(vault, note), 'utf8'), original); assert.equal(creates, 1);
+  await writeFile(join(vault, note), '---\ntype: note\n---\n');
+  await assert.rejects(core.createTask({ title: 'Invalid note', body: 'Task details', note }), /type: task/);
+  assert.equal(creates, 1, 'a bad note cannot orphan a new GitHub issue');
+});
+
+test('TaskNotes completion requires every issue completed, deduplicates requests and retries only with consent', async t => {
+  const vault = await mkdtemp(join(tmpdir(), 'gho-core-completion-')); t.after(() => rm(vault, { recursive: true, force: true }));
+  const note = 'task.md', original = '---\ntype: task\nstatus: open\n---\nKeep this text.\n'; await writeFile(join(vault, note), original);
+  const fake = new FakeGitHub(), core = new Core({ ...config, vault }, fake);
+  await core.notesLink(note, [1, 3]);
+  assert.deepEqual((await core.notesComplete())[0]?.waiting, [ref(1).url]);
+  fake.issues.set(1, rawIssue(1, { state: 'CLOSED', reason: 'NOT_PLANNED' }));
+  assert.deepEqual((await core.notesComplete())[0]?.waiting, [ref(1).url]);
+  fake.issues.set(1, rawIssue(1, { state: 'CLOSED', reason: 'COMPLETED' }));
+  const request = (await core.notesComplete())[0]?.request; assert.ok(request);
+  const reads = fake.commands.length;
+  assert.equal((await core.notesComplete(true))[0]?.state?.status, 'pending');
+  assert.equal(fake.commands.length, reads, 'pending work does not re-query GitHub');
+  const receipts = join(vault, '.github-orchestrator/receipts'); await mkdir(receipts);
+  await writeFile(join(receipts, `${request.id}.json`), JSON.stringify({ schemaVersion: 1, requestId: request.id, linkId: request.linkId, issueFingerprint: request.issueFingerprint, status: 'api-unavailable' }));
+  assert.equal((await core.notesComplete())[0]?.state?.status, 'api-unavailable');
+  assert.equal((await readdir(join(vault, '.github-orchestrator/requests'))).length, 1);
+  const retry = (await core.notesComplete(true))[0]?.request; assert.ok(retry); assert.notEqual(retry.id, request.id);
+  assert.equal((await readdir(join(vault, '.github-orchestrator/requests'))).length, 2);
+  assert.equal(await readFile(join(vault, note), 'utf8'), original);
+});
+
 test('reviews keep human empty-body approvals but ignore agent bodies and agent-only replies', () => {
   const review = { id: 1, user: { login: 'alice' }, state: 'APPROVED', submitted_at: '2026-01-01T00:00:00Z', html_url: 'https://github.com/acme/repo/pull/1#review-1', body: '' };
   assert.equal(byAgent(review, []), false); assert.equal(byAgent({ ...review, body: ' [agent:] approved' }, []), true); assert.equal(byAgent(review, [{ body: '[agent:] reply' }]), true);

@@ -9,7 +9,7 @@ metadata:
 <!-- Purpose: teach the supervisor the service-based workflow. Audience: interactive supervisor agent. Injection: installed Pi skill. -->
 # Supervise GitHub work with gho
 
-You help the user plan work and operate the service through its CLI. The service owns scheduling, worktrees, Pi processes, retries, phase transitions, and reviewer feedback. Do not launch implementer/reviewer processes, send tmux input, write execution checkpoints, or build your own polling loops.
+You help the user plan work and operate the service through its CLI. The service owns scheduling, worktrees, Pi processes, retries, phase transitions, and reviewer feedback. Do not launch implementer/reviewer processes, open service-owned sessions directly, write execution checkpoints, or build your own polling loops.
 
 ## Plan and register
 Discuss the goal and split it into bounded issues. Each issue needs a goal, scope, acceptance criteria, and verification commands. Record dependencies with native blocked-by links:

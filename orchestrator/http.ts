@@ -157,7 +157,7 @@ export async function startServer(api: ServiceAPI, options: ServerOptions = {}):
     index = await readFile(new URL("index.html", assetRoot), "utf8");
   }
   const assets = new Map<string, [string, string]>([
-    ["/", ["text/html; charset=utf-8", index.replaceAll("__GHO_TOKEN__", token).replace("<head>", '<head>\n  <meta name="gho-orchestration" content="enabled">')]],
+    ["/", ["text/html; charset=utf-8", index.replaceAll("__GHO_TOKEN__", token)]],
     ["/app.js", ["text/javascript; charset=utf-8", await readFile(new URL("app.js", assetRoot), "utf8")]],
     ["/style.css", ["text/css; charset=utf-8", await readFile(new URL("style.css", assetRoot), "utf8")]],
   ]);

@@ -6,11 +6,9 @@ The frontend uses system fonts and plain JavaScript. It needs no runtime package
 
 ## Run and check
 
-Start the dashboard with `gho dashboard` from a configured repository, then open the printed URL. The TypeScript server in `orchestrator/http.ts` serves `index.html`, `app.js`, and `style.css` at `/`, `/app.js`, and `/style.css`. It inserts the per-process token and an orchestration capability marker into the page.
+Start the dashboard with `gho dashboard` from a configured repository, then open the printed URL. The TypeScript server in `orchestrator/http.ts` serves `index.html`, `app.js`, and `style.css` at `/`, `/app.js`, and `/style.css`. It inserts the per-process session token into the page. The graph, execution controls, and agent conversations use this service API.
 
-The same assets remain compatible with the Rust dashboard. Rust embeds the three files and omits the capability marker, so that dashboard keeps its graph and existing tmux focus controls without calling the orchestration API. Rebuild the Rust executable after changing an embedded asset.
-
-Run the frontend checks from the repository root with Node.js 20 or later:
+Run the frontend checks from the repository root with Node.js 24 or later:
 
 ```sh
 cd dashboard
@@ -22,7 +20,7 @@ npm run build
 
 Opening `index.html` directly does not load tasks. The dashboard needs the server API.
 
-For tailnet access, use `gho dashboard --tailscale-serve [--port 8080]`. The command keeps the backend on loopback, manages a temporary Tailscale Serve proxy, and prints the node's HTTP URL. The same relative asset/API URLs work through the proxy. Tailnet access rules control who can read tasks and agent transcripts, start or steer agents, approve skeletons, and pause/resume tasks; there is no dashboard login. See [Tailscale access](../README.md#tailscale-access) for requirements and shutdown behavior.
+For tailnet access, use `gho dashboard --tailscale-serve [--port 8080]`. The command keeps the backend on loopback, manages a temporary Tailscale Serve proxy, and prints the node's HTTP URL. The same relative asset/API URLs work through the proxy. Tailnet access rules control who can read tasks and agent transcripts, start or steer agents, approve skeletons, and pause/resume tasks; there is no dashboard login. See [Local and tailnet access](../README.md#local-and-tailnet-access) for requirements and shutdown behavior.
 
 ## Interface
 
@@ -32,7 +30,6 @@ For tailnet access, use `gho dashboard --tailscale-serve [--port 8080]`. The com
 - Arrows point from blockers to their dependents. Only dependencies whose endpoints are both visible in the configured repository are drawn. Cycles share a graph column and are marked on the affected cards.
 - Select a card with a click, Enter, or Space to open its details. Use Tab or arrow keys to move between task cards. Escape closes the details and returns focus to the card.
 - Drag the graph background to pan. Use the zoom controls, `+` / `−`, or Control/Command + scroll to zoom. **Fit graph** (or `F` with graph focus) includes every visible task, even when this needs a scale below 12%. Zoom controls work smoothly from that fitted scale. The initial view keeps cards larger for readability. Keyboard focus brings off-screen cards into view.
-- Select a task pane, then use **Focus task pane** to select that task’s window and pane in tmux. Clients attached to that session show it. The browser sends only the issue number and pane ID, never a command. Missing panes and server failures have explicit messages.
 - Automatic refresh is off by default to limit GitHub API usage. Opt in with **Refresh every 60s**, or use **Refresh** manually. When enabled, automatic refresh runs 60 seconds after the previous request finishes and pauses while the page is hidden. Failed refreshes retain the last successful graph with a visible stale-data warning.
 
 ## Task execution and agent conversations
@@ -69,8 +66,6 @@ Roles are `implementer` and `reviewer`; arbitrary agent names, commands, RPC met
 
 The server binds only to `127.0.0.1`. Exact Host and Origin checks, singleton security headers, the per-process token, bounded bodies, absolute request deadlines, and a content security policy protect the API. Tailscale mode adds only validated node authorities and manages an owned foreground Serve process; it refuses occupied or Funnel-enabled ports and never resets shared configuration. No GitHub credentials are sent to the browser.
 
-The legacy Rust dashboard additionally exposes `POST /api/focus` with `{ "issue": 42, "pane": "%3" }`. The TypeScript dashboard does not expose terminal focus.
-
 Task text, including issue descriptions, is rendered as text, not HTML or Markdown. Links must be absolute HTTP(S) URLs on `github.com` without credentials or nonstandard ports. All external links use `noopener noreferrer`. The dashboard does not load images or other resources from task content.
 
 ## Browser test selectors
@@ -80,12 +75,9 @@ Task text, including issue descriptions, is rendered as text, not HTML or Markdo
 - `#graph-viewport`, `#graph-state`, `#graph-nodes .task-node`, `#task-42`
 - `#graph-edges .dependency-edge[data-from="41"][data-to="42"]`
 - `#detail-panel`, `#detail-title`, `#close-detail`
-- `#pane-select`, `#focus-pane-button`, `#focus-result`
-- `#error-banner`, `#tmux-warning`, `#refresh-status`
+- `#error-banner`, `#runtime-status`, `#refresh-status`
 - `#zoom-in`, `#zoom-out`, `#fit-graph`, `#zoom-level`
 
 Execution selectors include `#run-list`, `#run-panel`, `#run-mode`, `#start-task`, `#run-phase`, `#skeleton-sha`, `#approve-skeleton`, `#pause-task`, `#resume-task`, `#run-action-result`, `#agent-role`, `#agent-session`, `#agent-transcript`, `#agent-message`, `#send-agent-message`, and `#agent-dialogs`.
 
-See [`tests/orchestration-browser/README.md`](../tests/orchestration-browser/README.md) for Playwright CLI tests against the actual TypeScript server and a synthetic service. The existing [`tests/dashboard_e2e/`](../tests/dashboard_e2e/) suite covers the Rust dashboard. Neither suite needs real GitHub mutations or a real tmux session.
-
-`tests/fit-browser.js` exports `checkLargeGraphFit(page, url)` for the integrated Playwright suite. It intercepts the snapshot with 100 independent tasks, verifies every card fits inside the viewport, and checks smooth zooming below 12%. Use a fresh Playwright page and a running local dashboard URL; the helper adds no frontend dependency.
+See [`tests/orchestration-browser/README.md`](../tests/orchestration-browser/README.md) for Playwright CLI tests against the actual TypeScript server and a synthetic service. They cover graph filters, safe links, keyboard navigation, large-graph fit, task controls, and agent conversations without real GitHub or model calls.

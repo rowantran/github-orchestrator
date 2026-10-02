@@ -3,18 +3,6 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  rust:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      # Worktrunk (wt) is not installed here, so its integration tests skip themselves.
-      - run: cargo test --locked
   orchestration:
     runs-on: ubuntu-latest
     steps:
@@ -26,6 +14,8 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm install --global @earendil-works/pi-coding-agent@0.99.2
       - run: npm test
+      - run: npm test && npm run build
+        working-directory: dashboard
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser
       - uses: actions/upload-artifact@v4
@@ -34,7 +24,7 @@ jobs:
           name: orchestration-browser-results
           path: tests/orchestration-browser/test-results/
           retention-days: 7
-  typescript:
+  obsidian:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -49,33 +39,4 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm test
       - run: npm run build
-  dashboard:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22.23.0'
-          cache: npm
-          cache-dependency-path: tests/dashboard_e2e/package-lock.json
-      - run: npm test && npm run build
-        working-directory: dashboard
-      - run: cargo build --locked
-      - run: sudo apt-get update && sudo apt-get install -y tmux
-      - run: npm ci --ignore-scripts
-        working-directory: tests/dashboard_e2e
-      - run: npx playwright install --with-deps chromium
-        working-directory: tests/dashboard_e2e
-      - run: npm test
-        working-directory: tests/dashboard_e2e
-        env:
-          GHO_E2E_REQUIRE_REAL_TMUX: '1'
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: dashboard-browser-results
-          path: tests/dashboard_e2e/test-results/
-          retention-days: 7
-# Live GitHub, a paid model and a real Obsidian vault are never used here.
+# Tests never use live GitHub, paid models, a real Tailscale daemon, or a real Obsidian vault.

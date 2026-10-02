@@ -76,7 +76,13 @@ async function fixtureRepo(t: TestContext) {
 }
 
 test("actual bin exposes CLI help and version without GitHub or Pi calls", async (t) => {
-  const { cli, calls } = await fixtureRepo(t);
+  const { cli, calls, cwd, env } = await fixtureRepo(t);
+  // Exercise the shebang executable too, not just "node bin/gho.mjs".
+  assert.match(success(await run(bin, ["--help"], cwd, env)), /Usage: gho/);
+  const manifest = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
+  assert.equal(manifest.bin.gho, "bin/gho.mjs");
+  assert.deepEqual(manifest.pi.extensions, [], "The report extension is explicit per worker, never package-autoloaded");
+  assert.deepEqual(manifest.pi.skills, ["./agent-context/github-orchestrator"]);
   assert.match(success(await cli("--help")), /Usage: gho/);
   for (const command of ["service", "agent", "run", "approve"])
     assert.match(success(await cli(command, "--help")), new RegExp(command));
@@ -139,4 +145,18 @@ test("actual service detaches from CLI, stays idle on start, reuses one daemon a
   assert.equal(existsSync(join(runtime, "service.lock")), false);
   assert.deepEqual(JSON.parse(success(await cli("service", "stop"))), { stopped: true });
   assert.equal(await readFile(calls, "utf8"), "");
+});
+
+test("actual review wait carries its cursor across polls instead of rereading agent comments", async (t) => {
+  const { cli, configure, calls, env } = await fixtureRepo(t);
+  await configure();
+  await writeFile(calls, "");
+  env.GHO_CLI_SCENARIO = "reviews";
+  const result = JSON.parse(success(await cli("wait", "review", "--pr", "5", "--interval", "1", "--timeout", "1")));
+  assert.equal(result.result, "timeout");
+  assert.equal(result.cursor, "2026-01-01T00:00:05Z,2");
+  assert.deepEqual(result.reviews, []);
+  const log = (await readFile(calls, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  assert(log.filter(call => call.args[3]?.includes("/reviews?")).length >= 2);
+  assert.equal(log.filter(call => call.args[3]?.includes("/comments?")).length, 1);
 });

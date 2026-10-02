@@ -278,18 +278,14 @@ export function startDashboard() {
   const $ = (id) => document.getElementById(id);
   const state = {
     snapshot: null, group: new URL(location.href).searchParams.get("group") || "", query: "", selected: null,
-    graph: null, scale: 1, x: 0, y: 0, refreshing: false, timer: null, updated: null, focusPending: false,
+    graph: null, scale: 1, x: 0, y: 0, refreshing: false, timer: null, updated: null,
   };
   const viewport = $("graph-viewport"), stage = $("graph-stage"), detail = $("detail-panel");
   const token = document.querySelector('meta[name="gho-token"]')?.content || "";
   let resizeTimer;
-  const orchestration = document.querySelector('meta[name="gho-orchestration"]')?.content === "enabled";
   const live = { runs: new Map(), loaded: false, role: "implementer", timer: null, polling: false, pending: false, view: null, panelIssue: null, panel: null, runSignature: "", viewSignature: "", listSignature: "", drafts: new Map() };
-  if (orchestration) {
-    document.body.classList.add("orchestration");
-    $("run-list-section").hidden = false;
-    $("runtime-status").hidden = false;
-  }
+  $("run-list-section").hidden = false;
+  $("runtime-status").hidden = false;
 
   async function api(path, options = {}) {
     const response = await fetch(path, {
@@ -414,14 +410,11 @@ export function startDashboard() {
       if (cyclic) bits.push("Cycle");
       else if (prs.length) bits.push(`${prs.length} PR${prs.length === 1 ? "" : "s"}`);
       footer.append(element("span", "", bits.join(" · ")));
-      if (list(task.panes).length) { const pane = element("span", "pane-indicator", "▣"); pane.title = "Task pane available"; footer.append(pane); }
-      if (orchestration) {
-        const phase = element("span", "run-phase-small");
-        phase.dataset.runIssue = task.number;
-        const run = live.runs.get(task.number);
-        phase.textContent = run ? PHASES[run.phase] || run.phase : "";
-        footer.append(phase);
-      }
+      const phase = element("span", "run-phase-small");
+      phase.dataset.runIssue = task.number;
+      const run = live.runs.get(task.number);
+      phase.textContent = run ? PHASES[run.phase] || run.phase : "";
+      footer.append(phase);
       button.append(top, title, footer);
       button.addEventListener("click", () => selectTask(task.number));
       button.addEventListener("focus", () => revealNode(task.number));
@@ -485,7 +478,7 @@ export function startDashboard() {
     state.selected = number;
     renderSelection();
     renderDetail();
-    if (orchestration) pollLocal();
+    pollLocal();
     revealNode(number);
     $("detail-title").focus({ preventScroll: true });
   }
@@ -510,30 +503,6 @@ export function startDashboard() {
       groups.append(...task.workstreams.map((name) => element("span", "group-tag", name)));
       content.push(groups);
     }
-    if (orchestration) content.push(runPanel(task));
-    const focus = detailSection("Local task pane");
-    const panes = list(task.panes);
-    if (panes.length) {
-      const label = element("label", "field-label", panes.length > 1 ? "Choose a pane" : "Task pane");
-      label.htmlFor = "pane-select";
-      const select = element("select"); select.id = "pane-select";
-      select.append(...panes.map((pane) => {
-        const option = element("option", "", `${text(pane.session)} / ${text(pane.window)} · ${text(pane.id)}`);
-        option.value = text(pane.id); return option;
-      }));
-      focus.append(label, select);
-    }
-    const focusButton = element("button", "button primary focus-button", "Focus task pane");
-    focusButton.type = "button"; focusButton.id = "focus-pane-button";
-    focusButton.disabled = !panes.length || state.focusPending;
-    focusButton.setAttribute("aria-describedby", "focus-help");
-    focusButton.addEventListener("click", () => focusPane(task.number));
-    focus.append(focusButton);
-    const help = element("p", "filter-help", panes.length ? "Selects this task’s window and pane in tmux. Clients attached to that session show it. It does not start or run commands." : state.snapshot.tmux_warning ? `Pane discovery is unavailable: ${state.snapshot.tmux_warning}` : task.worktree ? "No tmux pane is open in this task’s worktree." : "This task has no local worktree or available tmux pane.");
-    help.id = "focus-help";
-    const result = element("p", "focus-result"); result.id = "focus-result"; result.setAttribute("role", "status");
-    focus.append(help, result);
-    if (!orchestration) content.push(focus);
     const prs = detailSection("Pull requests");
     if (!list(task.pull_requests).length) prs.append(element("p", "muted", "No pull requests."));
     for (const pr of list(task.pull_requests)) {
@@ -546,7 +515,7 @@ export function startDashboard() {
       item.append(line, element("p", "branch-line", `${text(pr.head) || "Unknown head"} → ${text(pr.base) || "Unknown base"}`));
       prs.append(item);
     }
-    content.push(prs);
+    content.push(prs, runPanel(task));
     const blockers = detailSection("Blocked by");
     if (!list(task.blockers).length) blockers.append(element("p", "muted", "No blockers."));
     for (const blocker of list(task.blockers)) {
@@ -795,7 +764,7 @@ export function startDashboard() {
   }
 
   async function pollLocal() {
-    if (!orchestration || live.polling || document.hidden) return;
+    if (live.polling || document.hidden) return;
     clearTimeout(live.timer); live.polling = true;
     try {
       const runs = await api("/api/runs");
@@ -818,29 +787,9 @@ export function startDashboard() {
     }
   }
 
-  async function focusPane(issue) {
-    if (state.focusPending) return;
-    const pane = $("pane-select")?.value;
-    if (!pane) return;
-    state.focusPending = true;
-    $("focus-pane-button").disabled = true;
-    $("focus-result").classList.remove("failure");
-    $("focus-result").textContent = "Focusing pane…";
-    try {
-      const result = await api("/api/focus", { method: "POST", body: JSON.stringify({ issue, pane }) });
-      if (state.selected === issue) $("focus-result").textContent = text(result.message) || "Task pane focused.";
-    } catch (error) {
-      if (state.selected === issue) { $("focus-result").textContent = `Could not focus pane: ${error.message}`; $("focus-result").classList.add("failure"); }
-    } finally {
-      state.focusPending = false;
-      if ($("focus-pane-button")) $("focus-pane-button").disabled = !$("pane-select");
-    }
-  }
-
   function renderGraph(resetView = false) {
     if (!state.snapshot) return;
     const active = document.activeElement?.id;
-    const paneChoice = $("pane-select")?.value;
     const visible = filterTasks(state.snapshot.tasks, state.group, state.query);
     if (!visible.some((task) => task.number === state.selected)) state.selected = null;
     state.graph = layoutGraph(visible, state.snapshot.repo);
@@ -858,7 +807,6 @@ export function startDashboard() {
     }
     for (const id of ["zoom-in", "zoom-out", "fit-graph"]) $(id).disabled = !visible.length;
     if (resetView) requestAnimationFrame(() => fitGraph(true));
-    if (paneChoice && $("pane-select") && [...$("pane-select").options].some((option) => option.value === paneChoice)) $("pane-select").value = paneChoice;
     if (active && $(active)) $(active).focus({ preventScroll: true });
   }
 
@@ -885,8 +833,6 @@ export function startDashboard() {
       const project = githubUrl(snapshot.project_url);
       $("project-link").hidden = !project;
       if (project) $("project-link").href = project;
-      $("tmux-warning").hidden = !snapshot.tmux_warning;
-      $("tmux-warning").textContent = snapshot.tmux_warning ? `Pane discovery: ${snapshot.tmux_warning}` : "";
       announceError("");
       renderGroups(); renderGraph(firstLoad);
       $("refresh-status").textContent = `Updated ${state.updated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;

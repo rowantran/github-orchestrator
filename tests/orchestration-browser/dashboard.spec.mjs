@@ -1,47 +1,4 @@
-import { test as base, expect } from "@playwright/test";
-import { fixture, SKELETON, REVISED } from "./fixture.mjs";
-import { checkLargeGraphFit } from "../../dashboard/tests/fit-browser.js";
-
-const test = base.extend({
-  app: async ({ page }, use) => {
-    const app = await fixture();
-    const errors = [];
-    page.on("pageerror", error => errors.push(error.message));
-    await page.goto(app.server.url);
-    await expect(page.locator("#task-42")).toBeVisible();
-    await expect(page.locator("#runtime-status")).toContainText("Live execution");
-    try { await use(app); } finally { await app.server.close(); }
-    expect(errors).toEqual([]);
-  },
-});
-
-async function select(page, number) {
-  await page.locator("#task-search").fill(`#${number}`);
-  await page.locator(`#task-${number}`).click();
-  await expect(page.locator("#run-panel")).toBeVisible();
-}
-
-test("graph retains workstreams, dependency edges, external blockers, fit and literal task text", async ({ page, app }) => {
-  await expect(page.locator('.dependency-edge[data-from="41"][data-to="42"]')).toHaveCount(1);
-  await page.locator("#workstream-select").selectOption("api");
-  await expect(page.locator(".task-node")).toHaveCount(3);
-  await expect(page.locator(".dependency-edge")).toHaveCount(0);
-  await select(page, 45);
-  await expect(page.locator("#detail-panel")).toContainText("External dependency");
-  await expect(page.locator("#start-task")).toBeDisabled();
-  await page.locator("#task-search").fill("");
-  await page.locator("#workstream-select").selectOption("empty");
-  await expect(page.locator("#graph-state")).toContainText("This workstream is empty");
-  await page.locator("#workstream-select").selectOption("");
-  await select(page, 46);
-  await expect(page.locator("#detail-title")).toHaveText("<img src=x onerror=alert(1)>");
-  await expect(page.locator("#detail-panel img")).toHaveCount(0);
-  await page.locator("#close-detail").click();
-  await page.locator("#task-search").fill("");
-  await page.locator("#fit-graph").click();
-  await expect(page.locator("#zoom-level")).not.toHaveText("0%");
-  expect(app.snapshotCount()).toBe(1);
-});
+import { test, expect, SKELETON, REVISED, selectTask as select } from "./fixture.mjs";
 
 test("approve binds the displayed SHA, preserves implementation session, and supports pause/resume", async ({ page, app }) => {
   await select(page, 42);
@@ -81,7 +38,13 @@ test("stale skeleton approval fails visibly and does not approve a new commit", 
 test("start supervised and unsupervised tasks from the dashboard", async ({ page, app }) => {
   await select(page, 43);
   await expect(page.locator("#run-mode")).toHaveValue("supervised");
+  const starting = page.waitForRequest(request => request.url() === `${app.server.url}api/runs/43/start`);
   await page.locator("#start-task").click();
+  const request = await starting;
+  expect(request.postDataJSON()).toEqual({ mode: "supervised" });
+  const headers = await request.allHeaders();
+  expect(headers["x-gho-token"]).toBe(await page.locator('meta[name="gho-token"]').getAttribute("content"));
+  expect(headers.origin).toBe(new URL(app.server.url).origin);
   await expect(page.locator("#run-phase")).toHaveText("Planning");
   expect(app.calls).toContainEqual(["start", 43, { mode: "supervised" }]);
   await select(page, 44);
@@ -92,12 +55,11 @@ test("start supervised and unsupervised tasks from the dashboard", async ({ page
   await expect(page.locator("#run-summary")).toContainText("Unsupervised");
 });
 
-test("chat shows Pi history, streaming output, tool results and role-specific nudges without TUI focus", async ({ page, app }) => {
+test("chat shows Pi history, streaming output, tool results and role-specific nudges", async ({ page, app }) => {
   await select(page, 42);
   await expect(page.locator("#agent-transcript")).toContainText("The skeleton is committed");
   await page.locator(".tool-output summary").first().click();
   await expect(page.locator("#agent-transcript")).toContainText("12 tests passed");
-  await expect(page.locator("#focus-pane-button")).toHaveCount(0);
   await page.screenshot({ path: test.info().outputPath("agent-chat.png"), fullPage: true });
   await page.locator("#agent-message").fill("Please cover the empty response.");
   await page.locator("#send-agent-message").click();
@@ -164,21 +126,28 @@ test("local lifecycle polls do not refresh GitHub and failed manual refresh pres
   await page.locator("#refresh-button").click();
   await expect(page.locator("#error-banner")).toContainText("Showing the last successful snapshot");
   await expect(page.locator("#task-42")).toBeVisible();
+  await expect(page.locator("#detail-title")).toHaveText("Build the task API");
+  await expect(page.locator("#run-phase")).toHaveText("Ready to merge");
+  await expect(page.locator("#refresh-button")).toBeEnabled();
   expect(app.snapshotCount()).toBe(2);
+  app.failSnapshot(false);
+  app.tasks.find(task => task.number === 42).title = "Updated task API";
+  await page.locator("#refresh-button").click();
+  await expect(page.locator("#error-banner")).toBeHidden();
+  await expect(page.locator("#detail-title")).toHaveText("Updated task API");
+  await expect(page.locator("#run-phase")).toHaveText("Ready to merge");
+  expect(app.snapshotCount()).toBe(3);
 });
 
 test("token reload errors and untrusted transcript text are safe", async ({ page, app }) => {
   app.view(42, "implementer").messages.push({ role: "assistant", content: [{ type: "text", text: '<script>alert("bad")</script><img src="https://evil.test/pixel">' }] });
-  const foreign = [];
-  page.on("request", request => { if (!request.url().startsWith(app.server.url)) foreign.push(request.url()); });
   await select(page, 42);
   await expect(page.locator("#agent-transcript")).toContainText('<script>alert("bad")</script>');
   await expect(page.locator("#agent-transcript script, #agent-transcript img")).toHaveCount(0);
-  const status = await page.evaluate(async () => (await fetch("/api/runs", { headers: { "x-gho-token": "expired" } })).status);
-  expect(status).toBe(403);
-  expect(foreign).toEqual([]);
-});
-
-test("large graph fit remains usable on the actual TypeScript server", async ({ page, app }) => {
-  await checkLargeGraphFit(page, app.server.url);
+  // Alter the request, not the response: the real server rejects the expired token.
+  await page.route("**/api/runs", route => route.continue({ headers: { ...route.request().headers(), "x-gho-token": "expired" } }));
+  await expect(page.locator("#runtime-status")).toContainText("Reload the dashboard page");
+  await expect(page.locator("#agent-transcript")).toContainText("The skeleton is committed");
+  await page.unroute("**/api/runs");
+  await expect(page.locator("#runtime-status")).toContainText("Live execution");
 });

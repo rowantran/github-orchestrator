@@ -14,7 +14,7 @@
     "bin/",
     "dist/orchestrator/",
     "agent-context/",
-    "extensions/*.mjs",
+    "extensions/orchestration.mjs",
     "dashboard/app.js",
     "dashboard/index.html",
     "dashboard/style.css",
@@ -26,9 +26,9 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test extensions/tests/*.test.mjs dist/tests/*.test.js",
+    "test": "npm run build && node --test dist/tests/*.test.js",
     "test:browser": "npm run build && playwright test --config tests/orchestration-browser/playwright.config.ts",
     "prepare": "npm run build"
   },
@@ -46,8 +46,6 @@
     "skills": [
       "./agent-context/github-orchestrator"
     ],
-    "extensions": [
-      "./extensions/agent-status.mjs"
-    ]
+    "extensions": []
   }
 }

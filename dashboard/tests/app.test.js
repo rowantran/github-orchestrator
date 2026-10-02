@@ -5,7 +5,7 @@ import { CARD, STATUS, dependencyEdges, edgePath, filterTasks, fitViewport, gith
 
 const repo = "owner/repo";
 function task(number, extra = {}) {
-  return { number, title: `Task ${number}`, state: "ready", body: "", branch: "", workstreams: [], blockers: [], pull_requests: [], panes: [], ...extra };
+  return { number, title: `Task ${number}`, state: "ready", body: "", branch: "", workstreams: [], blockers: [], pull_requests: [], ...extra };
 }
 function blocker(number, extra = {}) { return { number, repo, state: "blocked", ...extra }; }
 function snapshot(tasks = [], workstreams = []) { return { repo, tasks, workstreams }; }

@@ -8,8 +8,8 @@ The TypeScript service is the deterministic executor. The supervisor agent plans
 | Component | Owns |
 | --- | --- |
 | GitHub | Issue content, assignment, Project membership, dependencies, workstreams, PRs, CI, human feedback, and merge state. |
-| `orchestrator/core/` | GitHub CLI adapter, configuration, dependency classification, Worktrunk provisioning, workstreams, and TaskNotes bridge. No Rust subprocess delegation. |
-| `orchestrator/cli.ts` | User/supervisor commands, JSON output, service lifecycle, and legacy task-management commands. |
+| `orchestrator/core/` | GitHub CLI adapter, configuration, dependency classification, Worktrunk provisioning, workstreams, and TaskNotes bridge. |
+| `orchestrator/cli.ts` | User/supervisor commands, JSON output, service lifecycle, and task-management commands. |
 | `orchestrator/service.ts` | Independent service process, repository-scoped ownership, HTTP server, and runtime discovery. |
 | `orchestrator/engine.ts` | Lifecycle gates, ready-task dispatch, concurrency, retry limits, review/fix loops, approval, and reconciliation. |
 | `orchestrator/store.ts` | Private atomic execution checkpoints and bounded agent event reads. No local task database. |
@@ -20,7 +20,7 @@ The TypeScript service is the deterministic executor. The supervisor agent plans
 | `agent-context/runtime/` | All worker/reviewer instructions, phase prompts, recovery instructions, and report-tool description. |
 | `agent-context/github-orchestrator/SKILL.md` | Supervisor instructions for operating the CLI. |
 
-The existing Rust sources and agent-status extension remain as legacy regression references during migration. They do not launch or manage the new agents. The TypeScript npm executable is the supported entry point for orchestration.
+The npm-installed `gho` executable and service are entirely TypeScript. The Pi package loads only the supervisor skill by default; the service explicitly loads `extensions/orchestration.mjs` for its workers. Agent status comes from their RPC events, not a separate status-file extension.
 
 ## Task lifecycle
 
@@ -88,4 +88,4 @@ Tailscale sharing is explicit. It validates exact node names, refuses occupied S
 - RPC tests use fake subprocesses for framing, failure, backpressure, dialogs, and cleanup. An installed-Pi smoke test verifies normal resource discovery without a model request.
 - HTTP tests cover routing, token/Host/Origin validation, limits, shutdown, and Tailscale ownership.
 - Playwright CLI tests exercise task selection, agent inspection, messages, explicit approval, dialogs, and failure recovery in the browser.
-- The Rust suite and legacy dashboard tests remain available to catch migration regressions.
+- Regression coverage exercises the shipped TypeScript code, including the existing task-management behavior and dashboard graph/filter controls.

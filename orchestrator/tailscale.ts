@@ -68,7 +68,7 @@ function handlers(tcp: ObjectMap, web: ObjectMap): void {
   }
 }
 
-/** Parse the same closed Serve schema as the Rust dashboard. Unknown shapes fail closed. */
+/** Parse the closed Serve schema. Unknown shapes fail closed. */
 export function parseServeConfig(value: unknown, nested = false): Config {
   const raw = fields(value === null && !nested ? {} : value, ["TCP", "Web", "AllowFunnel", "Foreground", "Services"]);
   const TCP = map(raw, "TCP"), Web = map(raw, "Web"), AllowFunnel = map(raw, "AllowFunnel");
@@ -107,13 +107,15 @@ async function inspect(args: string[]): Promise<unknown> {
 async function config(): Promise<Config> { return parseServeConfig(await inspect(["serve", "status", "--json"])); }
 
 export async function prepareTailscale(requestedPort: number): Promise<TailscalePlan> {
-  const targetPort = requestedPort || 8080;
+  const targetPort = requestedPort === 0 ? 8080 : requestedPort;
   port(String(targetPort));
   const status = obj(await inspect(["status", "--json", "--peers=false"]));
   ensure(status.BackendState === "Running", "Tailscale is not running. Start tailscaled and authenticate with tailscale up first.");
   const self = obj(status.Self), tailnet = obj(status.CurrentTailnet);
-  const name = str(self, "DNSName").replace(/\.$/, "").toLowerCase(), suffix = str(tailnet, "MagicDNSSuffix").toLowerCase();
-  ensure(dns(name) && dns(suffix), "Invalid Tailscale DNS name or MagicDNS suffix; refusing to expose the dashboard.");
+  // Validate ASCII DNS before lowercasing can turn Unicode characters into accepted names.
+  const rawName = str(self, "DNSName").replace(/\.$/, ""), rawSuffix = str(tailnet, "MagicDNSSuffix");
+  ensure(dns(rawName) && dns(rawSuffix), "Invalid Tailscale DNS name or MagicDNS suffix; refusing to expose the dashboard.");
+  const name = rawName.toLowerCase(), suffix = rawSuffix.toLowerCase();
   const short = name.endsWith(`.${suffix}`) ? name.slice(0, -suffix.length - 1) : "";
   ensure(short && !short.includes(".") && short !== "localhost" && !/^\d+$/.test(short) && !/^0x[\da-f]*$/i.test(short) && tailnet.MagicDNSEnabled === true, "Enable MagicDNS and check this node's DNSName before using Tailscale Serve.");
   const authorities = [short, name].map(host => targetPort === 80 ? host : `${host}:${targetPort}`);

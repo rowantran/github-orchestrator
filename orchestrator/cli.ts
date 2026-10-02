@@ -5,6 +5,7 @@ import { Core, initConfig, loadConfig, parseIssue, issueUrl, systemRunner, type 
 import { descriptor, ensureService, findService, runtimeDirectory, serve, serviceRequest, type ServiceDescriptor, type ServiceOptions } from './service.js';
 import { stopService, waitForAgents } from './wait.js';
 import type { Mode, Role, Run } from './types.js';
+import { checkVersion } from './version.js';
 
 const json = (value: unknown) => { console.log(JSON.stringify(value, null, 2)); };
 function integer(text: string): number { const n = Number(text); if (!Number.isSafeInteger(n) || n < 0) throw new InvalidArgumentError('Expected a nonnegative integer.'); return n; }
@@ -30,6 +31,8 @@ export async function main(argv = process.argv): Promise<void> {
   program.command('doctor').description('Check GitHub, worktree, and Pi prerequisites').action(async () => {
     const api = await core();
     const result = await api.doctor();
+    const version = await checkVersion(systemRunner);
+    result[version.ok ? 'checks' : 'warnings'].push(version.message);
     try { await systemRunner.run({ argv: ['pi', '--version'], cwd: api.config.checkout }); result.checks.push('Pi available'); }
     catch { result.warnings.push('Pi is not available on PATH; install Pi before starting agents.'); }
     try { await systemRunner.run({ argv: ['flock', '--version'], cwd: api.config.checkout }); result.checks.push('flock available for OS-held worker locks'); }
@@ -138,8 +141,10 @@ export async function main(argv = process.argv): Promise<void> {
       }
       if (!pr) throw new Error('No open pull request from this branch.');
       const started = Date.now();
+      let cursor = opts.since as string | undefined;
       while (true) {
-        const result = await api.checkReviews(pr, opts.since);
+        const result = await api.checkReviews(pr, cursor);
+        cursor = result.cursor;
         if (result.result !== 'waiting') { json(result); return; }
         if (opts.timeout !== undefined && Date.now() - started >= opts.timeout * 1000) { json({ ...result, result: 'timeout' }); return; }
         await sleep(opts.interval * 1000);

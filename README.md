@@ -27,7 +27,7 @@ gho init
 gho doctor
 ```
 
-`gho init` creates missing configuration files without overwriting existing files. Fill in your Project URL before using other commands.
+`gho init` creates missing configuration files without overwriting existing files. Fill in your Project URL before using other commands. `gho doctor` checks prerequisites and compares the CLI's build commit with the published `main` commit. An unknown, different, or unavailable version produces a warning, not a failure.
 
 `~/.config/github-orchestrator/config.toml`:
 
@@ -60,7 +60,7 @@ base_branch = "main"
 
 Repository settings can override the `[orchestration]` values. The checkout's `origin` selects the repository. `--config-dir PATH` or `GHO_CONFIG_DIR` selects a different configuration directory. Unknown keys fail validation. Restart the service after changing its configuration.
 
-**Migration:** the installed `gho` entry point is now `bin/gho.mjs`, backed entirely by TypeScript. Existing TOML configuration, branches, workstreams, and TaskNotes associations remain usable. The Rust implementation remains in the repository for regression coverage; the new CLI never calls it. If you previously installed the Rust binary, check `command -v gho` after linking and adjust `PATH` or uninstall the old Cargo package so the TypeScript entry point is selected. You can also run `node /path/to/github-orchestrator/bin/gho.mjs` directly. Existing manually managed worktrees are not silently adopted into agent execution.
+**Migration:** `gho` is now the npm-installed TypeScript CLI; the Rust implementation has been removed. Existing TOML configuration, branches, workstreams, and TaskNotes associations remain usable. If you previously installed the Cargo binary, check `command -v gho` after linking and adjust `PATH` or uninstall the old Cargo package so the npm executable is selected. Existing manually managed worktrees are not silently adopted into agent execution. The old tmux pane controls and `--gho-agent` status extension are replaced by the service-owned sessions, dashboard chat, and `gho agent` commands.
 
 ## Plan, register, and enroll work
 
@@ -185,15 +185,12 @@ Only issues closed as completed count toward note completion. See [obsidian-plug
 
 ```sh
 npm ci
-npm test                         # TypeScript core, engine, RPC, HTTP, and Pi extension tests
+npm test                         # core, engine, RPC, HTTP, CLI, and Pi integration tests
 npm run test:browser              # Playwright CLI: real HTTP server and browser flows
 (cd dashboard && npm test && npm run build)
 (cd obsidian-plugin && npm ci && npm test && npm run build)
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --check
 ```
 
 Browser setup: `npx playwright install --with-deps chromium`. Tests use temporary repositories/vaults, fake GitHub/Pi subprocesses, and isolated service state. The installed-Pi smoke test exercises real RPC resource discovery without a model request or real credentials. No test creates real issues/PRs or changes a real vault.
 
-[docs/architecture.md](docs/architecture.md) describes implementation ownership. The legacy browser regression suite is documented in [tests/dashboard_e2e/README.md](tests/dashboard_e2e/README.md).
+[docs/architecture.md](docs/architecture.md) describes implementation ownership. [tests/orchestration-browser/README.md](tests/orchestration-browser/README.md) describes the Playwright CLI suite for the TypeScript service and dashboard.

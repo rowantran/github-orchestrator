@@ -51,7 +51,7 @@ test("HTTP facade serves only bundled assets with token and security headers", a
   const { api, calls } = service(); const server = await startServer(api); t.after(() => server.close());
   assert.match(server.url, /^http:\/\/127\.0\.0\.1:\d+\/$/);
   const page = await fetch(server.url); const html = await page.text();
-  assert.match(html, new RegExp(server.token)); assert.match(html, /gho-orchestration/);
+  assert.match(html, new RegExp(server.token)); assert.doesNotMatch(html, /__GHO_TOKEN__|gho-orchestration/);
   assert.equal(page.headers.get("x-frame-options"), "DENY");
   assert.equal(page.headers.get("cache-control"), "no-store");
   assert.equal(page.headers.get("x-content-type-options"), "nosniff");
@@ -59,7 +59,7 @@ test("HTTP facade serves only bundled assets with token and security headers", a
   assert.match(page.headers.get("content-security-policy") ?? "", /connect-src 'self'/);
   assert.equal(page.headers.get("access-control-allow-origin"), null);
   for (const asset of ["/app.js", "/style.css"]) assert.equal((await query(server, asset)).status, 200);
-  for (const path of ["/package.json", "/api/files?path=/etc/passwd", "/.env", "/api/runs/42/agents/planner", "/api/runs/42/agents/implementer/rpc"]) {
+  for (const path of ["/package.json", "/api/files?path=/etc/passwd", "/.env", "/api/runs/42/agents/planner", "/api/runs/42/agents/implementer/rpc", "/api/focus"]) {
     assert.equal((await query(server, path)).status, 404, path);
   }
   assert.equal(calls.length, 0);

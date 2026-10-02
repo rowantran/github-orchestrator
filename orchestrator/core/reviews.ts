@@ -8,23 +8,40 @@ const bodyText = (value: unknown): string => value == null ? '' : text(value, 'f
 export function byAgent(review: JsonObject, comments: JsonObject[]): boolean {
   const body = bodyText(review.body); return body.trim() ? agentText(body) : comments.length > 0 && comments.every(comment => agentText(bodyText(comment.body)));
 }
-function validDate(value: string): boolean { return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) && Number.isFinite(Date.parse(value)); }
+function validDate(value: string): boolean {
+  const match = /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(value);
+  if (!match || !Number.isFinite(Date.parse(value))) return false;
+  // Date.parse normalizes impossible dates such as February 30 instead of rejecting them.
+  const day = new Date(`${match[1]}T00:00:00Z`);
+  return Number.isFinite(day.getTime()) && day.toISOString().slice(0, 10) === match[1];
+}
 function date(value: unknown): string { const result = text(value, 'feedback timestamp'); metadata(validDate(result), 'feedback timestamp'); return result; }
 function author(value: unknown): string | null { return value === null ? null : text(object(value, 'feedback user').login, 'feedback author'); }
 function reviewComment(comment: JsonObject): ReviewComment {
   const line = comment.line == null ? null : integer(comment.line, 'comment line', 1);
   return { id: integer(comment.id, 'comment ID', 1), url: text(comment.html_url, 'comment URL'), path: text(comment.path, 'comment path'), line: line ?? (comment.original_line == null ? null : integer(comment.original_line, 'original line', 1)), outdated: line === null, in_reply_to: comment.in_reply_to_id == null ? null : integer(comment.in_reply_to_id, 'reply ID', 1), body: bodyText(comment.body) };
 }
-export function submittedReviews(reviews: JsonObject[], comments: JsonObject[]): SubmittedReview[] {
-  const seen = new Set<number>(), result: SubmittedReview[] = [];
+interface ReviewCandidate { review: JsonObject; id: number; state: string; submitted_at: string }
+function reviewCandidates(reviews: JsonObject[]): ReviewCandidate[] {
+  const seen = new Set<number>(), result: ReviewCandidate[] = [];
   for (const review of reviews) {
     const id = integer(review.id, 'review ID', 1); metadata(!seen.has(id), 'duplicate review'); seen.add(id);
     const state = text(review.state, 'review state');
     if (review.submitted_at == null || !['COMMENTED', 'APPROVED', 'CHANGES_REQUESTED'].includes(state)) continue;
-    const grouped = comments.filter(c => c.pull_request_review_id === id); if (byAgent(review, grouped)) continue;
-    result.push({ id, url: text(review.html_url, 'review URL'), author: author(review.user), state, submitted_at: date(review.submitted_at), body: bodyText(review.body), comments: grouped.map(reviewComment) });
+    result.push({ review, id, state, submitted_at: date(review.submitted_at) });
   }
   return result.sort((a, b) => Date.parse(a.submitted_at) - Date.parse(b.submitted_at) || a.id - b.id);
+}
+function humanReviews(candidates: ReviewCandidate[], comments: JsonObject[]): SubmittedReview[] {
+  const result: SubmittedReview[] = [];
+  for (const { review, id, state, submitted_at } of candidates) {
+    const grouped = comments.filter(c => c.pull_request_review_id === id); if (byAgent(review, grouped)) continue;
+    result.push({ id, url: text(review.html_url, 'review URL'), author: author(review.user), state, submitted_at, body: bodyText(review.body), comments: grouped.map(reviewComment) });
+  }
+  return result;
+}
+export function submittedReviews(reviews: JsonObject[], comments: JsonObject[]): SubmittedReview[] {
+  return humanReviews(reviewCandidates(reviews), comments);
 }
 export function humanComments(comments: JsonObject[]): HumanComment[] {
   const ids = new Set<number>();
@@ -53,8 +70,11 @@ export async function checkReviews(github: GitHub, number: number, since = 'star
   const cursor = new ReviewCursor(since), status = await pullRequestStatus(github, number);
   const pull_request = { number, url: text(status.html_url), draft: boolean(status.draft) };
   if (status.merged || status.state === 'closed') return { result: status.merged ? 'merged' : 'closed', pull_request, reviews: [], cursor: cursor.toString() };
-  const raw = await readReviews(github, number), reviews = submittedReviews(raw.reviews, raw.comments).filter(r => !cursor.covers(r.submitted_at, r.id));
-  for (const review of reviews) cursor.advance(review.submitted_at, review.id);
+  const candidates = reviewCandidates(await github.restPages(`repos/${github.config.repo}/pulls/${number}/reviews?per_page=100`)).filter(r => !cursor.covers(r.submitted_at, r.id));
+  const comments = candidates.length ? await github.restPages(`repos/${github.config.repo}/pulls/${number}/comments?per_page=100`) : [];
+  const reviews = humanReviews(candidates, comments);
+  // Consume agent reviews too, without letting them end the wait or become feedback on a later poll.
+  for (const review of candidates) cursor.advance(review.submitted_at, review.id);
   return { result: reviews.length ? 'reviews' : 'waiting', pull_request, reviews, cursor: cursor.toString() };
 }
 export async function pullRequestStatus(github: GitHub, number: number): Promise<JsonObject> {

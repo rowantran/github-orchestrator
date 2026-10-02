@@ -55,7 +55,7 @@ export class Core {
     return this.workspace.recover(number, issue.title);
   }
   async createTask(options: CreateTaskOptions): Promise<Issue> {
-    ensure(typeof options.title === 'string' && options.title.trim().length > 0, 'Task title must not be blank.'); ensure(typeof options.body === 'string', 'Task body must be a string.');
+    ensure(typeof options.title === 'string' && options.title.trim().length > 0, 'Task title must not be blank.'); ensure(typeof options.body === 'string' && options.body.trim().length > 0, 'Task body must not be blank.');
     const github = new GitHub(this.config, this.runner), blockers = (options.blockedBy ?? []).map(value => parseIssue(value, this.config.repo)), workstreams = [...new Set(options.workstreams ?? [])];
     for (const name of workstreams) workstreamLabel(name);
     if (workstreams.length) { const known = await github.workstreams(); for (const name of workstreams) ensure(known.some(n => n.toLowerCase() === name.toLowerCase()), `Unknown workstream ${name}. Create it first.`); }

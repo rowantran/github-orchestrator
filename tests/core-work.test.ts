@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { surveyIssues, type Issues } from '../orchestrator/core/work.js';
-import { issueKey, issueRef, parseIssue, workstreamLabel } from '../orchestrator/core/domain.js';
+import { issueKey, issueRef, linked, parseIssue, workstreamLabel, workstreamNames } from '../orchestrator/core/domain.js';
 import type { Config, Issue, PullRequest } from '../orchestrator/core/types.js';
 import { CommandError, SystemRunner, type Runner } from '../orchestrator/core/process.js';
 import { initConfig, loadConfig, resolvePath } from '../orchestrator/core/config.js';
@@ -41,6 +41,40 @@ test('cycles block and external issues do not reuse local branches', async () =>
   const entries = await surveyIssues(config, source([a, b, c, external], [pr(9)]), noBranches, [a, b, c]);
   assert.deepEqual(entries.map(e => e.state), ['blocked', 'blocked', 'blocked']); assert.equal(entries[2]?.blockers[0]?.branch, null);
 });
+test('dependency details retain historical PRs and local worktrees without refetching surveyed issues', async () => {
+  const historical = { ...pr(1), state: 'MERGED' as const, head: 'someone/feature' };
+  const blocker = { ...task(1), pull_requests: [historical] }, dependent = { ...task(2, [1]), body: 'Keep issue instructions.' };
+  const issues = [dependent, blocker];
+  const src: Issues = { issue: async () => { throw new Error('Surveyed issue must not be fetched again'); }, openPullRequest: async () => null };
+  const entries = await surveyIssues(config, src, { ...noBranches, worktrees: async () => new Map([['alice/gh-1', '/temporary/tree']]) }, issues);
+  assert.equal(entries[0]?.state, 'blocked'); assert.equal(entries[0]?.body, dependent.body);
+  assert.equal(entries[0]?.branch, 'alice/gh-2'); assert.equal(entries[0]?.worktree, null);
+  const detail = entries[0]?.blockers[0]; assert.ok(detail);
+  assert.equal(detail.state, 'in_progress'); assert.equal(detail.branch, 'alice/gh-1'); assert.equal(detail.worktree, '/temporary/tree');
+  assert.deepEqual(detail.pull_requests, [linked(historical)]);
+  const done = { ...blocker, state: 'CLOSED' as const, state_reason: 'COMPLETED' as const };
+  const completed = await surveyIssues(config, source([done, dependent]), noBranches, [dependent, done]);
+  assert.equal(completed[0]?.state, 'ready'); assert.equal(completed[1]?.state, 'done');
+});
+
+test('every dependency must finish and external blockers never borrow same-number local work', async () => {
+  const external = { ...task(1), reference: issueRef('other/repo', 1) };
+  const done = { ...task(2), state: 'CLOSED' as const, state_reason: 'COMPLETED' as const };
+  const dependent = { ...task(3), blockers: [done.reference, external.reference] };
+  const workspace = { ...noBranches, worktrees: async () => new Map([['alice/gh-1', '/local/tree']]) };
+  const entry = (await surveyIssues(config, source([external, done], [pr(1)]), workspace, [dependent]))[0]!;
+  assert.equal(entry.state, 'blocked'); assert.equal(entry.blockers[0]?.state, 'done');
+  assert.equal(entry.blockers[1]?.state, 'ready'); assert.equal(entry.blockers[1]?.branch, null); assert.equal(entry.blockers[1]?.worktree, null);
+  assert.equal(entry.blockers[1]?.repo, 'other/repo');
+});
+
+test('workstream labels honor the exact GitHub length boundary and do not inherit parents', () => {
+  assert.equal(workstreamLabel('a'.repeat(35)).length, 50);
+  assert.throws(() => workstreamLabel('a'.repeat(36)), /Invalid workstream name/);
+  assert.deepEqual(workstreamNames(['bug', 'gho:workstream:project/child', 'gho:workstream:other']), ['other', 'project/child']);
+  for (const name of ['a/../b', 'a\\b', 'a?b', 'a#b', 'a b', 'a\nb', '/root', 'trailing/']) assert.throws(() => workstreamLabel(name));
+});
+
 test('issue and workstream inputs reject traversal and invalid references', () => {
   assert.deepEqual(parseIssue('https://github.com/ACME/Repo/issues/42/'), { repo: 'acme/repo', number: 42 });
   for (const bad of ['0', '-2', '1e3', 'https://github.com/acme/repo/pull/4', '9007199254740992']) assert.throws(() => parseIssue(bad, config.repo));
